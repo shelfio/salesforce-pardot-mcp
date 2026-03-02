@@ -60,6 +60,47 @@ SF_OAUTH_CLIENT_SECRET = os.environ.get("SF_OAUTH_CLIENT_SECRET", "")
 SF_OAUTH_REDIRECT_URI = os.environ.get("SF_OAUTH_REDIRECT_URI", "")
 SF_OAUTH_LOGIN_URL = os.environ.get("SF_OAUTH_LOGIN_URL", "https://login.salesforce.com")
 
+# Salesforce API version for REST calls
+_SF_API_VERSION = "v59.0"
+
+
+async def detect_pardot_business_unit_id(
+    access_token: str, instance_url: str
+) -> str | None:
+    """
+    Auto-detect the Pardot Business Unit ID by querying the PardotTenant
+    sObject in Salesforce. Returns the ID (format 0Uv...) or None if
+    Pardot is not provisioned or the query fails.
+    """
+    soql = "SELECT Id FROM PardotTenant WHERE IsDeleted = false LIMIT 1"
+    url = f"{instance_url}/services/data/{_SF_API_VERSION}/query"
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers=headers, params={"q": soql})
+            if resp.status_code == 200:
+                data = resp.json()
+                records = data.get("records", [])
+                if records:
+                    buid = records[0].get("Id", "")
+                    if buid.startswith("0Uv"):
+                        logger.info("Auto-detected Pardot Business Unit ID: %s", buid)
+                        return buid
+                    logger.warning("PardotTenant record ID has unexpected prefix: %s", buid[:6])
+                    return buid  # return anyway, might still work
+                logger.info("No PardotTenant records found — Pardot may not be provisioned")
+            else:
+                logger.warning(
+                    "PardotTenant query failed (HTTP %d): %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+    except Exception as exc:
+        logger.warning("Failed to auto-detect Pardot Business Unit ID: %s", exc)
+
+    return None
+
 # ---------------------------------------------------------------------------
 # CSRF protection: state -> created_at (no api_key mapping needed anymore)
 # ---------------------------------------------------------------------------
@@ -442,6 +483,11 @@ async def oauth_callback(request: Request) -> HTMLResponse:
             status_code=502,
         )
 
+    # Auto-detect Pardot Business Unit ID from Salesforce
+    pardot_buid = await detect_pardot_business_unit_id(
+        token_data["access_token"], instance_url
+    )
+
     # Generate a cryptographically secure session token
     session_token = secrets.token_urlsafe(48)
 
@@ -450,7 +496,7 @@ async def oauth_callback(request: Request) -> HTMLResponse:
         refresh_token=token_data.get("refresh_token", ""),
         instance_url=instance_url,
         issued_at=time.time(),
-        pardot_business_unit_id=None,
+        pardot_business_unit_id=pardot_buid,
     )
     store.put(session_token, tokens)
 

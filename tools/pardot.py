@@ -96,13 +96,21 @@ class PardotClient:
     # -- HTTP helpers -------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
-        buid = os.environ.get("PARDOT_BUSINESS_UNIT_ID", "")
-        # Per-user override from token store
+        buid = ""
+        # Per-user BUID from token store (auto-detected during OAuth)
         store = get_token_store()
         if self._api_key and store:
             tokens = store.get(self._api_key)
             if tokens and tokens.get("pardot_business_unit_id"):
                 buid = tokens["pardot_business_unit_id"]
+        # Fallback to shared env var
+        if not buid:
+            buid = os.environ.get("PARDOT_BUSINESS_UNIT_ID", "")
+        if not buid:
+            logger.warning(
+                "Pardot-Business-Unit-Id is empty — Pardot API calls will fail "
+                "(error 181). Set PARDOT_BUSINESS_UNIT_ID env var or re-authenticate."
+            )
         return {
             "Authorization": f"Bearer {self._get_token()}",
             "Pardot-Business-Unit-Id": buid,

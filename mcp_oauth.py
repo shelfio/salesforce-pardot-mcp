@@ -32,6 +32,7 @@ from starlette.responses import JSONResponse, RedirectResponse
 from token_store import get_token_store, UserTokens
 from oauth import (
     _validate_instance_url,
+    detect_pardot_business_unit_id,
     SF_OAUTH_CLIENT_ID,
     SF_OAUTH_CLIENT_SECRET,
     SF_OAUTH_LOGIN_URL,
@@ -343,6 +344,11 @@ async def mcp_oauth_callback(request: Request):
             status_code=502,
         )
 
+    # Auto-detect Pardot Business Unit ID from Salesforce
+    pardot_buid = await detect_pardot_business_unit_id(
+        token_data["access_token"], instance_url
+    )
+
     # Generate authorization code for Claude Desktop
     auth_code = secrets.token_urlsafe(48)
 
@@ -354,6 +360,7 @@ async def mcp_oauth_callback(request: Request):
         "sf_access_token": token_data["access_token"],
         "sf_refresh_token": token_data.get("refresh_token", ""),
         "sf_instance_url": instance_url,
+        "sf_pardot_buid": pardot_buid,
         "created_at": time.time(),
     }
 
@@ -467,7 +474,7 @@ async def _handle_authorization_code(form) -> JSONResponse:
         refresh_token=code_data["sf_refresh_token"],
         instance_url=code_data["sf_instance_url"],
         issued_at=time.time(),
-        pardot_business_unit_id=None,
+        pardot_business_unit_id=code_data.get("sf_pardot_buid"),
     )
     store.put(session_token, tokens)
 
@@ -551,6 +558,13 @@ async def _handle_refresh_token(form) -> JSONResponse:
         except Exception as e:
             logger.warning("MCP OAuth: SF refresh error: %s", e)
 
+    # Re-detect Pardot BUID if missing (e.g., session created before auto-detect)
+    pardot_buid = old_tokens.get("pardot_business_unit_id")
+    if not pardot_buid:
+        pardot_buid = await detect_pardot_business_unit_id(
+            old_tokens["access_token"], old_tokens["instance_url"]
+        )
+
     # Generate new session token
     new_session_token = secrets.token_urlsafe(48)
     new_refresh_token = secrets.token_urlsafe(48)
@@ -560,7 +574,7 @@ async def _handle_refresh_token(form) -> JSONResponse:
         refresh_token=old_tokens.get("refresh_token", ""),
         instance_url=old_tokens["instance_url"],
         issued_at=time.time(),
-        pardot_business_unit_id=old_tokens.get("pardot_business_unit_id"),
+        pardot_business_unit_id=pardot_buid,
     )
     store.put(new_session_token, new_tokens)
 
