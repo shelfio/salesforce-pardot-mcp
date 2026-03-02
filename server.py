@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse
 
 from auth import BearerAuthMiddleware
 from tools import ALL_TOOLS
-from oauth import oauth_login, oauth_callback, oauth_status, oauth_revoke
+from oauth import oauth_login, oauth_callback, oauth_status, oauth_revoke, pardot_setup
 from mcp_oauth import (
     protected_resource_metadata,
     authorization_server_metadata,
@@ -148,6 +148,11 @@ async def _oauth_status(request: Request):
 @mcp.custom_route("/oauth/revoke", methods=["POST"])
 async def _oauth_revoke(request: Request):
     return await oauth_revoke(request)
+
+
+@mcp.custom_route("/pardot/setup", methods=["POST"])
+async def _pardot_setup(request: Request):
+    return await pardot_setup(request)
 
 
 # ---------------------------------------------------------------------------

@@ -95,6 +95,13 @@ class PardotClient:
 
     # -- HTTP helpers -------------------------------------------------------
 
+    @staticmethod
+    def _sanitize_buid(value: str) -> str:
+        """Validate BUID is alphanumeric to prevent HTTP header injection."""
+        if value and value.isalnum():
+            return value
+        return ""
+
     def _headers(self) -> dict[str, str]:
         buid = ""
         # Per-user BUID from token store (auto-detected during OAuth)
@@ -102,10 +109,10 @@ class PardotClient:
         if self._api_key and store:
             tokens = store.get(self._api_key)
             if tokens and tokens.get("pardot_business_unit_id"):
-                buid = tokens["pardot_business_unit_id"]
+                buid = self._sanitize_buid(tokens["pardot_business_unit_id"])
         # Fallback to shared env var
         if not buid:
-            buid = os.environ.get("PARDOT_BUSINESS_UNIT_ID", "")
+            buid = self._sanitize_buid(os.environ.get("PARDOT_BUSINESS_UNIT_ID", ""))
         if not buid:
             logger.warning(
                 "Pardot-Business-Unit-Id is empty — Pardot API calls will fail "
@@ -409,3 +416,60 @@ async def pardot_get_lifecycle_history(
         },
     )
     return {"lifecycle_history": result.get("values", [])}
+
+
+# ---------------------------------------------------------------------------
+# Configuration tools
+# ---------------------------------------------------------------------------
+
+_BUID_PREFIX = "0Uv"
+
+
+async def pardot_set_business_unit(
+    pardot_business_unit_id: Annotated[
+        str,
+        Field(
+            description=(
+                "Pardot Business Unit ID (starts with '0Uv', 15 or 18 characters). "
+                "Find it in Salesforce Setup → Quick Find → 'Business Unit Setup'."
+            )
+        ),
+    ],
+) -> dict:
+    """Set the Pardot Business Unit ID for the current session.
+
+    Use this tool when Pardot API calls fail with error 181 (missing
+    Business Unit ID). The BUID is normally auto-detected during OAuth,
+    but some orgs require it to be set manually.
+    """
+    api_key = get_current_api_key()
+    if not api_key:
+        raise ToolError("No active session — authenticate first")
+
+    store = get_token_store()
+    if not store:
+        raise ToolError("Token storage not configured on this server")
+
+    tokens = store.get(api_key)
+    if not tokens:
+        raise ToolError("Session not found or expired — re-authenticate")
+
+    buid = pardot_business_unit_id.strip()
+    if (
+        not buid
+        or not buid.startswith(_BUID_PREFIX)
+        or len(buid) not in (15, 18)
+        or not buid.isalnum()
+    ):
+        raise ToolError(
+            "Invalid Business Unit ID. Must start with '0Uv' and be 15 or 18 "
+            "alphanumeric characters. Find it in Salesforce Setup → Quick Find "
+            "→ 'Business Unit Setup'."
+        )
+
+    # Copy to avoid mutating the cache outside of the store lock
+    updated = dict(tokens)
+    updated["pardot_business_unit_id"] = buid
+    store.put(api_key, updated)
+
+    return {"success": True, "pardot_business_unit_id": buid}

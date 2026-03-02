@@ -79,6 +79,7 @@ async def detect_pardot_business_unit_id(
     url = f"{instance_url}/services/data/{_SF_API_VERSION}/tooling/query"
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
 
+    logger.info("Detecting Pardot BUID via Tooling API: %s", url)
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(url, headers=headers, params={"q": soql})
@@ -99,12 +100,17 @@ async def detect_pardot_business_unit_id(
                 logger.info("No PardotTenant records found — Pardot may not be provisioned")
             else:
                 logger.warning(
-                    "PardotTenant Tooling API query failed (HTTP %d): %s",
+                    "PardotTenant Tooling API query failed (HTTP %d): %s — "
+                    "Use POST /pardot/setup to set Business Unit ID manually",
                     resp.status_code,
-                    resp.text[:200],
+                    resp.text[:500],
                 )
     except Exception as exc:
-        logger.warning("Failed to auto-detect Pardot Business Unit ID: %s", exc)
+        logger.warning(
+            "Failed to auto-detect Pardot Business Unit ID: %s — "
+            "Use POST /pardot/setup to set manually",
+            exc,
+        )
 
     return None
 
@@ -547,8 +553,73 @@ async def oauth_status(request: Request) -> JSONResponse:
         return JSONResponse({
             "connected": True,
             "instance_url": tokens["instance_url"],
+            "pardot_business_unit_id": tokens.get("pardot_business_unit_id"),
         })
     return JSONResponse({"connected": False})
+
+
+# ---------------------------------------------------------------------------
+# /pardot/setup — manually set Pardot Business Unit ID
+# ---------------------------------------------------------------------------
+
+_BUID_PATTERN = "0Uv"
+
+
+async def pardot_setup(request: Request) -> JSONResponse:
+    """
+    Manually set the Pardot Business Unit ID for the current session.
+
+    Used when auto-detection via Tooling API fails (e.g. insufficient
+    permissions). The user can find their BUID in Salesforce Setup →
+    Quick Find → "Business Unit Setup".
+
+    POST /pardot/setup
+    Headers: Authorization: Bearer <session_token>
+    Body: {"pardot_business_unit_id": "0Uv..."}
+    """
+    session_token = _extract_session_token(request)
+    if not session_token:
+        return JSONResponse({"error": "Bearer token required"}, status_code=401)
+
+    store = get_token_store()
+    if not store:
+        return JSONResponse({"error": "Token storage not configured"}, status_code=503)
+
+    tokens = store.get(session_token)
+    if not tokens:
+        return JSONResponse({"error": "Session not found or expired"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    buid = body.get("pardot_business_unit_id", "").strip()
+    if (
+        not buid
+        or not buid.startswith(_BUID_PATTERN)
+        or len(buid) not in (15, 18)
+        or not buid.isalnum()
+    ):
+        return JSONResponse(
+            {
+                "error": "Invalid pardot_business_unit_id",
+                "detail": "Must start with '0Uv', be 15 or 18 alphanumeric characters. "
+                          "Find it in Salesforce Setup → Quick Find → 'Business Unit Setup'.",
+            },
+            status_code=400,
+        )
+
+    # Copy tokens to avoid mutating the cache outside of the store lock
+    updated_tokens = dict(tokens)
+    updated_tokens["pardot_business_unit_id"] = buid
+    store.put(session_token, updated_tokens)
+
+    logger.info(
+        "Pardot BUID set manually: %s (session: %s)",
+        buid, _token_fingerprint(session_token),
+    )
+    return JSONResponse({"success": True, "pardot_business_unit_id": buid})
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ from tools.pardot import (
     pardot_get_form_handlers,
     pardot_get_emails,
     pardot_get_lifecycle_history,
+    pardot_set_business_unit,
 )
 
 # Read-only tools (always enabled)
@@ -55,6 +56,7 @@ READ_TOOLS = [
     pardot_get_form_handlers,
     pardot_get_emails,
     pardot_get_lifecycle_history,
+    pardot_set_business_unit,
 ]
 
 # Write tools (disabled by default — set ENABLE_WRITE_TOOLS=true to enable)
