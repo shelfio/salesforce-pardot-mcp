@@ -115,21 +115,26 @@ class PardotClient:
             return value
         return ""
 
-    def _headers(self) -> dict[str, str]:
+    def _get_buid(self) -> str:
+        """Resolve Business Unit ID from token store or env var."""
         buid = ""
-        # Per-user BUID from token store (auto-detected during OAuth)
         store = get_token_store()
         if self._api_key and store:
             tokens = store.get(self._api_key)
             if tokens and tokens.get("pardot_business_unit_id"):
                 buid = self._sanitize_buid(tokens["pardot_business_unit_id"])
-        # Fallback to shared env var
         if not buid:
             buid = self._sanitize_buid(os.environ.get("PARDOT_BUSINESS_UNIT_ID", ""))
+        return buid
+
+    def _headers(self) -> dict[str, str]:
+        buid = self._get_buid()
         if not buid:
-            logger.warning(
-                "Pardot-Business-Unit-Id is empty — Pardot API calls will fail "
-                "(error 181). Set PARDOT_BUSINESS_UNIT_ID env var or re-authenticate."
+            raise ToolError(
+                "Pardot Business Unit ID is not configured. "
+                "Use the pardot_set_business_unit tool to set it. "
+                "Find it in Salesforce Setup → Quick Find → 'Business Unit Setup' "
+                "(starts with '0Uv', 15 or 18 characters)."
             )
         return {
             "Authorization": f"Bearer {self._get_token()}",
@@ -296,7 +301,10 @@ async def pardot_get_prospect_by_email(
 ) -> dict:
     """Get a single Pardot prospect by their email address."""
     client = get_pardot_client()
-    result = await client.get("prospects", params={"email": email})
+    result = await client.get("prospects", params={
+        "fields": "id,email,firstName,lastName,score,campaignId,createdAt,updatedAt",
+        "email": email,
+    })
     prospects: list[dict] = result.get("values", [])
     if not prospects:
         raise ToolError(f"No prospect found with email: {email}")
@@ -436,14 +444,19 @@ async def pardot_get_lifecycle_history(
 ) -> dict:
     """Get lifecycle stage progression history for a Pardot prospect."""
     client = get_pardot_client()
+    # Pardot API v5 lifecycle-histories endpoint does NOT support prospectId
+    # as a query parameter — only id and createdAt filters are available.
+    # We fetch all records and filter client-side.
     result = await client.get(
         "lifecycle-histories",
         params={
-            "prospectId": prospect_id,
             "fields": "id,prospectId,previousStageId,nextStageId,secondsInStage,createdAt",
         },
     )
-    return {"lifecycle_history": result.get("values", [])}
+    all_histories = result.get("values", [])
+    # Client-side filter by prospect ID
+    histories = [h for h in all_histories if str(h.get("prospectId", "")) == str(prospect_id)]
+    return {"lifecycle_history": histories}
 
 
 # ---------------------------------------------------------------------------
