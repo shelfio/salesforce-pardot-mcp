@@ -69,11 +69,14 @@ async def detect_pardot_business_unit_id(
 ) -> str | None:
     """
     Auto-detect the Pardot Business Unit ID by querying the PardotTenant
-    sObject in Salesforce. Returns the ID (format 0Uv...) or None if
-    Pardot is not provisioned or the query fails.
+    object via the Salesforce Tooling API (not standard SOQL — PardotTenant
+    is a Tooling API object, available since API v56.0).
+
+    Returns the ID (format 0Uv...) or None if Pardot is not provisioned,
+    permissions are insufficient, or the query fails.
     """
-    soql = "SELECT Id FROM PardotTenant WHERE IsDeleted = false LIMIT 1"
-    url = f"{instance_url}/services/data/{_SF_API_VERSION}/query"
+    soql = "SELECT Id, PardotTenantName FROM PardotTenant LIMIT 1"
+    url = f"{instance_url}/services/data/{_SF_API_VERSION}/tooling/query"
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
 
     try:
@@ -84,15 +87,19 @@ async def detect_pardot_business_unit_id(
                 records = data.get("records", [])
                 if records:
                     buid = records[0].get("Id", "")
+                    name = records[0].get("PardotTenantName", "")
                     if buid.startswith("0Uv"):
-                        logger.info("Auto-detected Pardot Business Unit ID: %s", buid)
+                        logger.info(
+                            "Auto-detected Pardot Business Unit ID: %s (%s)",
+                            buid, name,
+                        )
                         return buid
                     logger.warning("PardotTenant record ID has unexpected prefix: %s", buid[:6])
                     return buid  # return anyway, might still work
                 logger.info("No PardotTenant records found — Pardot may not be provisioned")
             else:
                 logger.warning(
-                    "PardotTenant query failed (HTTP %d): %s",
+                    "PardotTenant Tooling API query failed (HTTP %d): %s",
                     resp.status_code,
                     resp.text[:200],
                 )
