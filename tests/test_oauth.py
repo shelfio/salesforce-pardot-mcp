@@ -97,7 +97,11 @@ class TestOAuthCallback(unittest.TestCase):
         request.query_params = {"code": "auth-code-123", "state": state}
         request.url = MagicMock()
         request.url.scheme = "https"
-        request.headers = {"host": "test-server.up.railway.app"}
+        request.headers = {
+            "host": "test-server.up.railway.app",
+            "x-forwarded-host": "evil.example.com",
+            "x-forwarded-proto": "https",
+        }
 
         result = asyncio.get_event_loop().run_until_complete(oauth_callback(request))
         self.assertEqual(result.status_code, 200)
@@ -108,6 +112,9 @@ class TestOAuthCallback(unittest.TestCase):
         self.assertIn("Session Token", body)
         self.assertIn("myorg.my.salesforce.com", body)
         self.assertIn("Copy Token", body)
+
+        # Server URL must come from SF_OAUTH_REDIRECT_URI, NOT spoofed headers
+        self.assertNotIn("evil.example.com", body)
 
         # Token store should have been called with a session token
         store_instance.put.assert_called_once()

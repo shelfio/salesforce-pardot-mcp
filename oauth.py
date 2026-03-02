@@ -519,10 +519,10 @@ async def oauth_callback(request: Request) -> HTMLResponse:
         instance_url,
     )
 
-    # Build server URL for config example
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost:8000"))
-    server_url = f"{scheme}://{host}"
+    # Build server URL from the trusted redirect URI (not from request headers,
+    # which are vulnerable to Host header injection / poisoning).
+    _parsed_redirect = urllib.parse.urlparse(SF_OAUTH_REDIRECT_URI)
+    server_url = f"{_parsed_redirect.scheme}://{_parsed_redirect.netloc}"
 
     return HTMLResponse(
         _SUCCESS_HTML.format(

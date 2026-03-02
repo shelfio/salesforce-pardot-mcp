@@ -79,17 +79,20 @@ class TestProtectedResourceMetadata(unittest.TestCase):
         self.assertEqual(body["bearer_methods_supported"], ["header"])
         self.assertEqual(len(body["authorization_servers"]), 1)
 
-    def test_server_url_from_headers(self):
+    def test_server_url_ignores_spoofed_headers(self):
+        """Server URL must come from SF_OAUTH_REDIRECT_URI, not request headers."""
         from mcp_oauth import protected_resource_metadata
         request = _make_request(headers={
             "x-forwarded-proto": "https",
-            "x-forwarded-host": "my-app.railway.app",
+            "x-forwarded-host": "evil.example.com",
             "host": "localhost:8000",
         })
         result = asyncio.get_event_loop().run_until_complete(protected_resource_metadata(request))
         import json
         body = json.loads(result.body)
-        self.assertEqual(body["resource"], "https://my-app.railway.app")
+        # Must use the env-configured redirect URI origin, NOT the spoofed header
+        self.assertEqual(body["resource"], "http://localhost:8000")
+        self.assertNotIn("evil.example.com", body["resource"])
 
 
 class TestAuthorizationServerMetadata(unittest.TestCase):

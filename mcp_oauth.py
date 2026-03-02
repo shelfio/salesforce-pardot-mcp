@@ -82,10 +82,17 @@ _ALLOWED_REDIRECT_SCHEMES = ("https", "http")
 
 
 def _get_server_url(request: Request) -> str:
-    """Build the external server URL from request headers."""
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost:8000"))
-    return f"{scheme}://{host}"
+    """Derive the external server URL from the trusted SF_OAUTH_REDIRECT_URI.
+
+    Previous implementation read Host / X-Forwarded-Host headers, which are
+    spoofable (Host header poisoning).  The redirect URI is set via env var
+    and cannot be influenced by the request.
+    """
+    if SF_OAUTH_REDIRECT_URI:
+        parsed = urllib.parse.urlparse(SF_OAUTH_REDIRECT_URI)
+        return f"{parsed.scheme}://{parsed.netloc}"
+    # Fallback for unconfigured dev environments only
+    return f"{request.url.scheme}://{request.url.netloc}"
 
 
 def _cleanup_expired_codes() -> None:
