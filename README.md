@@ -2,11 +2,9 @@
 
 A remote [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server providing Salesforce CRM and Pardot (Marketing Cloud Account Engagement) tools over SSE transport. Built with [FastMCP](https://github.com/jlowin/fastmcp), designed for deployment on [Railway](https://railway.app/).
 
-Supports **MCP-native OAuth** — users connect via Claude Desktop UI with zero configuration. Also supports a browser-based OAuth fallback for other MCP clients.
+Users connect via **MCP OAuth 2.1** — Claude Desktop handles authentication automatically with zero configuration.
 
 ## How It Works
-
-### Option 1: MCP Native OAuth (Recommended)
 
 ```
 1. In Claude Desktop: Settings → Connectors → Add custom connector
@@ -15,21 +13,7 @@ Supports **MCP-native OAuth** — users connect via Claude Desktop UI with zero 
 4. User logs in → Done. All tools appear automatically.
 ```
 
-Claude Desktop handles token management (acquire, store, refresh) automatically via PKCE-secured OAuth.
-
-### Option 2: Manual Token Flow (Fallback)
-
-```
-1. User visits https://your-server.up.railway.app/login
-2. Server redirects to Salesforce OAuth (login.salesforce.com)
-3. User logs into their Salesforce org
-4. Salesforce redirects back with an authorization code
-5. Server exchanges the code for tokens and generates a session token
-6. User receives a page with the session token and connection instructions
-7. User adds the session token to their MCP client configuration
-```
-
-One Connected App on the server handles all users across all Salesforce organizations.
+Claude Desktop handles token management (acquire, store, refresh) automatically via PKCE-secured OAuth. One Connected App on the server handles all users across all Salesforce organizations.
 
 ## Available Tools (17 read-only + 5 write)
 
@@ -61,31 +45,48 @@ The server runs in **read-only mode by default**. Write tools (update/create) ar
 | `pardot_get_lists` | read | List all lists |
 | `pardot_get_forms` | read | List all forms |
 | `pardot_add_prospect_to_list` | **write** | Add a prospect to a list |
-| `pardot_get_visitor_activities` | read | Get visitor activities (page views, form fills, email clicks) |
+| `pardot_get_visitor_activities` | read | Get visitor activities with type enrichment (label + category) and friendly name filtering (`form_submit`, `email_open`, `bounce`, etc.) |
 | `pardot_get_form_handlers` | read | List all form handlers |
 | `pardot_get_emails` | read | List email templates and sends |
 | `pardot_get_lifecycle_history` | read | Get lifecycle stage progression for a prospect |
 | `pardot_set_business_unit` | read | Set Pardot Business Unit ID for the current session |
+
+### Visitor Activity Types
+
+`pardot_get_visitor_activities` supports filtering by friendly name (`activity_type_name`) or numeric code (`activity_type`):
+
+| Category | Names | Codes |
+|---|---|---|
+| **Web** | `click`, `view`/`form_view`/`page_view`, `error`/`form_error`, `success`/`form_submit`/`form_success`, `session`, `site_search`, `visit`, `custom_redirect` | 1, 2, 3, 4, 5, 7, 20, 21 |
+| **Email** | `email_sent`, `email_open`, `unsubscribe`, `bounce`, `spam`, `email_preference`, `opt_in`, `third_party_click` | 6, 11, 12, 13, 14, 15, 16, 17 |
+| **Opportunity** | `opportunity_created`, `opportunity_won`, `opportunity_lost`, `opportunity_reopen`, `opportunity_linked`, `opportunity_unlinked` | 8, 9, 10, 18, 19, 38 |
+
+Each returned activity is enriched with `activityLabel` and `category` fields.
 
 ## Security
 
 | Feature | Details |
 |---|---|
 | **Read-only by default** | Write tools disabled unless `ENABLE_WRITE_TOOLS=true` is set |
-| **Authentication** | Bearer token — session tokens (from OAuth) or legacy API keys |
+| **Authentication** | Bearer token — session tokens from MCP OAuth 2.1 flow |
 | **MCP OAuth (PKCE S256)** | Authorization code flow with mandatory PKCE, timing-safe verification |
 | **Redirect URI validation** | Only `https://` allowed (+ `http://localhost` for dev); DCR-registered URIs enforced |
 | **Session TTL** | Session tokens expire after 24 hours (configurable via `SESSION_TTL_SECONDS`) |
 | **SKIP_AUTH restriction** | `SKIP_AUTH` only works in stdio mode (local), ignored for remote SSE |
 | **Rate limiting** | 60 requests/minute per token (sliding window) |
+| **DCR rate limiting** | 10 requests/minute per IP for client registration |
 | **Memory limits** | Auth codes (500), registered clients (200), refresh tokens (1000) capped to prevent DoS |
+| **Security headers** | HSTS, X-Content-Type-Options, X-Frame-Options, CSP `default-src 'none'`, Cache-Control `no-store` |
 | **SOQL injection protection** | User input escaped before inclusion in queries |
 | **Read-only enforcement** | `sf_query` only accepts SELECT statements |
-| **SF protected fields** | `OwnerId`, `IsConverted`, `IsDeleted`, `MasterRecordId` cannot be updated |
+| **SF protected fields** | `OwnerId`, `IsConverted`, `IsDeleted`, `MasterRecordId` cannot be updated (case-insensitive) |
 | **Pardot protected fields** | `email`, `score`, `grade`, `isDoNotEmail`, `isDoNotCall`, `salesforceId`, `crmContactFid`, `crmLeadFid` cannot be updated |
+| **Pardot ID validation** | Numeric-only validation on prospect/list IDs prevents path injection |
+| **Error truncation** | API error messages capped at 200 chars to prevent org data leaks |
 | **Audit logging** | SHA-256 key fingerprint logged per request |
 | **Token encryption** | Per-user OAuth tokens encrypted at rest with Fernet (AES-128-CBC) |
-| **Instance URL validation** | Only `*.salesforce.com` and `*.force.com` domains accepted |
+| **HMAC cache keys** | Client cache uses HMAC-hashed keys to prevent raw token exposure in memory |
+| **Instance URL validation** | Only `*.salesforce.com`, `*.force.com`, `*.salesforce.mil`, `*.cloudforce.com` accepted |
 | **Input sanitization** | Client names sanitized (control chars stripped, length limited) |
 | **Header injection protection** | Pardot Business Unit ID validated as alphanumeric before use in HTTP headers |
 
@@ -120,7 +121,6 @@ cp .env.example .env
 python server.py
 # → Listening on http://0.0.0.0:8000 (SSE)
 # → Health check: http://localhost:8000/health
-# → Login page: http://localhost:8000/login
 ```
 
 ### Railway Deployment
@@ -139,33 +139,12 @@ docker build -t sf-mcp .
 docker run -p 8000:8000 --env-file .env sf-mcp
 ```
 
-## Connecting an MCP Client
-
-### Claude Desktop (MCP Native OAuth)
+## Connecting Claude Desktop
 
 1. Open Claude Desktop: **Settings → Connectors → Add custom connector**
 2. Enter URL: `https://your-server.up.railway.app/sse`
 3. Leave OAuth Client ID/Secret empty (Dynamic Client Registration handles it)
 4. Click Add → Salesforce login popup → Done
-
-### Other MCP Clients (Manual Token)
-
-After visiting `/login` and authenticating with Salesforce, paste the session token into your MCP client config:
-
-```json
-{
-  "mcpServers": {
-    "salesforce": {
-      "url": "https://your-server.up.railway.app/sse",
-      "headers": {
-        "Authorization": "Bearer YOUR_SESSION_TOKEN"
-      }
-    }
-  }
-}
-```
-
-Restart the MCP client after saving.
 
 ## Environment Variables
 
@@ -179,7 +158,6 @@ Restart the MCP client after saving.
 | `PORT` | No | Server port (default: `8000`) |
 | `ENABLE_WRITE_TOOLS` | No | Set to `true` to enable write tools (default: disabled, read-only mode) |
 | `SESSION_TTL_SECONDS` | No | Session token lifetime in seconds (default: `86400` — 24 hours) |
-| `TEAM_API_KEYS` | No | Comma-separated legacy API keys for backward compatibility |
 
 Generate an encryption key:
 
@@ -195,9 +173,6 @@ See `.env.example` for a full template with comments.
 # Unit tests (no Salesforce connection needed)
 python -m pytest tests/test_security.py -v
 
-# OAuth flow tests
-python -m pytest tests/test_oauth.py -v
-
 # MCP OAuth tests (PKCE, token exchange, security hardening)
 python -m pytest tests/test_mcp_oauth.py -v
 
@@ -212,20 +187,19 @@ docker run --rm sf-pardot-mcp-tests
 ## Project Structure
 
 ```
-server.py              # Entry point — FastMCP + SSE + health + OAuth routes
-auth.py                # Bearer token middleware (session tokens + legacy keys)
+server.py              # Entry point — FastMCP + SSE + health + OAuth routes + security headers
+auth.py                # Bearer token middleware (session tokens from MCP OAuth)
 user_context.py        # ContextVar for per-request user identity
-token_store.py         # Fernet-encrypted per-user OAuth token storage
-oauth.py               # Self-service OAuth flow (/login, /callback, /status, /revoke)
-mcp_oauth.py           # MCP-native OAuth (metadata, authorize, token, register, PKCE)
+token_store.py         # Fernet-encrypted per-user OAuth token storage (HMAC-keyed)
+oauth.py               # Shared OAuth utilities (SF config, instance URL validation, BUID detection)
+mcp_oauth.py           # MCP OAuth 2.1 Authorization Server (RFC 9728, RFC 8414, RFC 7591)
 tools/
   __init__.py          # Re-exports ALL_TOOLS list (17 read + 5 write, write opt-in)
   salesforce.py        # 10 Salesforce tools (SOQL, CRUD, pipeline, activities)
   pardot.py            # 12 Pardot tools (prospects, campaigns, activities, emails, config)
 tests/
-  test_security.py     # Unit tests — SOQL injection, field protection, auth, rate limiting
-  test_oauth.py        # OAuth flow tests — login redirect, callback, status, revoke
-  test_mcp_oauth.py    # MCP OAuth tests — PKCE, token exchange, security hardening
+  test_security.py     # Unit tests — SOQL injection, field protection, auth, rate limiting, activity types
+  test_mcp_oauth.py    # MCP OAuth tests — PKCE, token exchange, DCR, redirect validation
   test_integration.py  # Integration tests — server startup, health, SSE
 Dockerfile             # Production container
 Dockerfile.test        # Test runner container
