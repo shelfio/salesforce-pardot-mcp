@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from auth import BearerAuthMiddleware
 from tools import ALL_TOOLS
@@ -123,6 +125,26 @@ async def _oauth_callback(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Security headers middleware (C1)
+# ---------------------------------------------------------------------------
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+
+_security_middleware = [Middleware(SecurityHeadersMiddleware)]
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -135,6 +157,10 @@ if __name__ == "__main__":
         mcp.run(transport="stdio")
     else:
         # --- SSE mode: remote deployment (Railway) or local dev ---
+        # Validate required OAuth env vars early (M4)
+        from oauth import _validate_oauth_env_vars
+        _validate_oauth_env_vars()
+
         port = int(os.environ.get("PORT", 8000))
         ssl_certfile = os.environ.get("SSL_CERTFILE")
         ssl_keyfile = os.environ.get("SSL_KEYFILE")
@@ -146,6 +172,7 @@ if __name__ == "__main__":
                 host="0.0.0.0",
                 port=port,
                 uvicorn_config={"ssl_certfile": ssl_certfile, "ssl_keyfile": ssl_keyfile},
+                middleware=_security_middleware,
             )
         else:
             logger.warning(
@@ -155,4 +182,4 @@ if __name__ == "__main__":
                 "reverse proxy (e.g. Railway, Nginx).",
                 port,
             )
-            mcp.run(transport="sse", host="0.0.0.0", port=port)
+            mcp.run(transport="sse", host="0.0.0.0", port=port, middleware=_security_middleware)

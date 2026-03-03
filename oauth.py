@@ -49,6 +49,20 @@ SF_OAUTH_LOGIN_URL = os.environ.get("SF_OAUTH_LOGIN_URL", "https://login.salesfo
 _SF_API_VERSION = "v59.0"
 
 
+def _validate_oauth_env_vars() -> None:
+    """Fail fast if required OAuth environment variables are missing or empty."""
+    missing = []
+    if not SF_OAUTH_CLIENT_ID:
+        missing.append("SF_OAUTH_CLIENT_ID")
+    if not SF_OAUTH_CLIENT_SECRET:
+        missing.append("SF_OAUTH_CLIENT_SECRET")
+    if missing:
+        raise RuntimeError(
+            f"Required OAuth environment variables are not set: {', '.join(missing)}. "
+            "Copy .env.example to .env and fill in your Connected App credentials."
+        )
+
+
 async def detect_pardot_business_unit_id(
     access_token: str, instance_url: str
 ) -> str | None:

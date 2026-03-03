@@ -138,31 +138,52 @@ class TestOAuthAuthorize(unittest.TestCase):
         self.assertIn("S256", body["error_description"])
 
     def test_valid_params_redirects_to_salesforce(self):
-        from mcp_oauth import oauth_authorize, _auth_codes
+        from mcp_oauth import oauth_authorize, _auth_codes, _registered_clients
         _, challenge = _generate_pkce()
-        request = _make_request(query_params={
-            "client_id": "test-client",
-            "redirect_uri": "http://localhost/callback",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": "test-state-123",
-        })
-        result = asyncio.get_event_loop().run_until_complete(oauth_authorize(request))
-        # Should redirect to Salesforce
-        self.assertEqual(result.status_code, 307)
-        location = dict(result.headers).get("location", "")
-        self.assertIn("login.salesforce.com", location)
-        self.assertIn("response_type=code", location)
+
+        # Must register client first (H1: DCR required)
+        client_id = "test-client-authorize"
+        _registered_clients[client_id] = {
+            "redirect_uris": ["http://localhost/callback"],
+            "created_at": time.time(),
+        }
+
+        try:
+            request = _make_request(query_params={
+                "client_id": client_id,
+                "redirect_uri": "http://localhost/callback",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": "test-state-123",
+            })
+            result = asyncio.get_event_loop().run_until_complete(oauth_authorize(request))
+            # Should redirect to Salesforce
+            self.assertEqual(result.status_code, 307)
+            location = dict(result.headers).get("location", "")
+            self.assertIn("login.salesforce.com", location)
+            self.assertIn("response_type=code", location)
+        finally:
+            _registered_clients.pop(client_id, None)
+            # Clean up pending auth codes
+            codes_to_remove = [k for k, v in _auth_codes.items() if v.get("client_id") == client_id]
+            for k in codes_to_remove:
+                del _auth_codes[k]
 
 
 class TestOAuthToken(unittest.TestCase):
     """Verify /oauth/token endpoint."""
 
+    def _make_token_request(self, form_data):
+        """Create a mock request for /oauth/token with client IP."""
+        request = MagicMock()
+        request.form = AsyncMock(return_value=form_data)
+        request.client = MagicMock()
+        request.client.host = "127.0.0.1"
+        return request
+
     def test_unsupported_grant_type(self):
         from mcp_oauth import oauth_token
-        request = MagicMock()
-        form_data = {"grant_type": "client_credentials"}
-        request.form = AsyncMock(return_value=form_data)
+        request = self._make_token_request({"grant_type": "client_credentials"})
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
         import json
@@ -171,23 +192,19 @@ class TestOAuthToken(unittest.TestCase):
 
     def test_missing_code_returns_400(self):
         from mcp_oauth import oauth_token
-        request = MagicMock()
-        form_data = {"grant_type": "authorization_code"}
-        request.form = AsyncMock(return_value=form_data)
+        request = self._make_token_request({"grant_type": "authorization_code"})
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
 
     def test_invalid_code_returns_400(self):
         from mcp_oauth import oauth_token
-        request = MagicMock()
-        form_data = {
+        request = self._make_token_request({
             "grant_type": "authorization_code",
             "code": "nonexistent-code",
             "code_verifier": "some-verifier",
             "client_id": "test-client",
             "redirect_uri": "http://localhost/callback",
-        }
-        request.form = AsyncMock(return_value=form_data)
+        })
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
         import json
@@ -216,15 +233,13 @@ class TestOAuthToken(unittest.TestCase):
         store_instance = MagicMock()
         mock_store.return_value = store_instance
 
-        request = MagicMock()
-        form_data = {
+        request = self._make_token_request({
             "grant_type": "authorization_code",
             "code": auth_code,
             "code_verifier": verifier,
             "client_id": "test-client",
             "redirect_uri": "http://localhost/callback",
-        }
-        request.form = AsyncMock(return_value=form_data)
+        })
 
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 200)
@@ -270,15 +285,13 @@ class TestOAuthToken(unittest.TestCase):
         store_instance = MagicMock()
         mock_store.return_value = store_instance
 
-        request = MagicMock()
-        form_data = {
+        request = self._make_token_request({
             "grant_type": "authorization_code",
             "code": auth_code,
             "code_verifier": "totally-wrong-verifier",
             "client_id": "test-client",
             "redirect_uri": "http://localhost/callback",
-        }
-        request.form = AsyncMock(return_value=form_data)
+        })
 
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
@@ -308,15 +321,13 @@ class TestOAuthToken(unittest.TestCase):
             "created_at": time.time(),
         }
 
-        request = MagicMock()
-        form_data = {
+        request = self._make_token_request({
             "grant_type": "authorization_code",
             "code": auth_code,
             "code_verifier": verifier,
             "client_id": "different-client",
             "redirect_uri": "http://localhost/callback",
-        }
-        request.form = AsyncMock(return_value=form_data)
+        })
 
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
@@ -341,15 +352,13 @@ class TestOAuthToken(unittest.TestCase):
             "created_at": time.time() - 700,  # Expired (>600s)
         }
 
-        request = MagicMock()
-        form_data = {
+        request = self._make_token_request({
             "grant_type": "authorization_code",
             "code": auth_code,
             "code_verifier": verifier,
             "client_id": "test-client",
             "redirect_uri": "http://localhost/callback",
-        }
-        request.form = AsyncMock(return_value=form_data)
+        })
 
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
@@ -361,19 +370,23 @@ class TestOAuthToken(unittest.TestCase):
 class TestOAuthRefreshToken(unittest.TestCase):
     """Verify refresh token flow."""
 
+    def _make_token_request(self, form_data):
+        """Create a mock request for /oauth/token with client IP."""
+        request = MagicMock()
+        request.form = AsyncMock(return_value=form_data)
+        request.client = MagicMock()
+        request.client.host = "127.0.0.1"
+        return request
+
     def test_missing_refresh_token_returns_400(self):
         from mcp_oauth import oauth_token
-        request = MagicMock()
-        form_data = {"grant_type": "refresh_token"}
-        request.form = AsyncMock(return_value=form_data)
+        request = self._make_token_request({"grant_type": "refresh_token"})
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
 
     def test_invalid_refresh_token_returns_400(self):
         from mcp_oauth import oauth_token
-        request = MagicMock()
-        form_data = {"grant_type": "refresh_token", "refresh_token": "invalid-token"}
-        request.form = AsyncMock(return_value=form_data)
+        request = self._make_token_request({"grant_type": "refresh_token", "refresh_token": "invalid-token"})
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 400)
         import json
@@ -417,9 +430,7 @@ class TestOAuthRefreshToken(unittest.TestCase):
         mock_http.post = AsyncMock(return_value=mock_response)
         mock_client_cls.return_value = mock_http
 
-        request = MagicMock()
-        form_data = {"grant_type": "refresh_token", "refresh_token": refresh_tok}
-        request.form = AsyncMock(return_value=form_data)
+        request = self._make_token_request({"grant_type": "refresh_token", "refresh_token": refresh_tok})
 
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
         self.assertEqual(result.status_code, 200)
@@ -572,7 +583,6 @@ class TestAuthCodeSingleUse(unittest.TestCase):
         store_instance = MagicMock()
         mock_store.return_value = store_instance
 
-        request = MagicMock()
         form_data = {
             "grant_type": "authorization_code",
             "code": auth_code,
@@ -580,7 +590,10 @@ class TestAuthCodeSingleUse(unittest.TestCase):
             "client_id": "test-client",
             "redirect_uri": "http://localhost/callback",
         }
+        request = MagicMock()
         request.form = AsyncMock(return_value=form_data)
+        request.client = MagicMock()
+        request.client.host = "127.0.0.1"
 
         # First exchange — should succeed
         result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
@@ -694,11 +707,11 @@ class TestDCRRedirectUriValidation(unittest.TestCase):
         finally:
             del _registered_clients[client_id]
 
-    def test_unregistered_client_validated_by_scheme(self):
-        """Unregistered clients have their redirect_uri validated by scheme."""
+    def test_unregistered_client_rejected(self):
+        """Unregistered clients must be rejected (H1: DCR required)."""
         from mcp_oauth import _validate_redirect_uri_for_client
-        self.assertTrue(_validate_redirect_uri_for_client("unknown-client", "https://example.com/cb"))
-        self.assertFalse(_validate_redirect_uri_for_client("unknown-client", "javascript:alert(1)"))
+        self.assertFalse(_validate_redirect_uri_for_client("unknown-client", "https://example.com/cb"))
+        self.assertFalse(_validate_redirect_uri_for_client("unknown-client", "http://localhost/callback"))
 
     def test_register_rejects_invalid_redirect_uris(self):
         """DCR registration must reject invalid redirect_uris."""
@@ -731,9 +744,16 @@ class TestMemoryLimits(unittest.TestCase):
 
     def test_max_pending_codes_enforced(self):
         """Exceeding MAX_PENDING_CODES returns 429."""
-        from mcp_oauth import oauth_authorize, _auth_codes, MAX_PENDING_CODES
+        from mcp_oauth import oauth_authorize, _auth_codes, _registered_clients, MAX_PENDING_CODES
 
         _, challenge = _generate_pkce()
+
+        # Register the client first (H1: DCR required)
+        client_id = "test-max-codes"
+        _registered_clients[client_id] = {
+            "redirect_uris": ["http://localhost/callback"],
+            "created_at": time.time(),
+        }
 
         # Fill up _auth_codes to the limit
         original_codes = dict(_auth_codes)
@@ -742,7 +762,7 @@ class TestMemoryLimits(unittest.TestCase):
 
         try:
             request = _make_request(query_params={
-                "client_id": "test",
+                "client_id": client_id,
                 "redirect_uri": "http://localhost/callback",
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
@@ -753,6 +773,7 @@ class TestMemoryLimits(unittest.TestCase):
             # Restore original state
             _auth_codes.clear()
             _auth_codes.update(original_codes)
+            _registered_clients.pop(client_id, None)
 
     def test_max_registered_clients_enforced(self):
         """Exceeding MAX_REGISTERED_CLIENTS returns 429."""
@@ -827,36 +848,176 @@ class TestSFRedirectUriFromEnv(unittest.TestCase):
 
     def test_authorize_uses_env_redirect_uri(self):
         """The SF OAuth redirect must use SF_OAUTH_REDIRECT_URI env var."""
-        from mcp_oauth import oauth_authorize, _auth_codes
+        from mcp_oauth import oauth_authorize, _auth_codes, _registered_clients
 
         _, challenge = _generate_pkce()
-        # Use a spoofed X-Forwarded-Host — should NOT affect SF redirect
-        request = _make_request(
-            headers={
-                "x-forwarded-host": "evil-spoofed-host.com",
-                "host": "real-server.railway.app",
-            },
-            query_params={
-                "client_id": "test",
+
+        # Must register client first (H1: DCR required)
+        client_id = "test-env-redirect"
+        _registered_clients[client_id] = {
+            "redirect_uris": ["http://localhost/callback"],
+            "created_at": time.time(),
+        }
+
+        try:
+            # Use a spoofed X-Forwarded-Host — should NOT affect SF redirect
+            request = _make_request(
+                headers={
+                    "x-forwarded-host": "evil-spoofed-host.com",
+                    "host": "real-server.railway.app",
+                },
+                query_params={
+                    "client_id": client_id,
+                    "redirect_uri": "http://localhost/callback",
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                },
+            )
+            result = asyncio.get_event_loop().run_until_complete(oauth_authorize(request))
+            self.assertEqual(result.status_code, 307)
+
+            location = dict(result.headers).get("location", "")
+            # SF redirect_uri param should use env var, NOT the spoofed host
+            self.assertNotIn("evil-spoofed-host", location)
+            self.assertIn("redirect_uri=", location)
+        finally:
+            _registered_clients.pop(client_id, None)
+            # Clean up pending auth codes created by this test
+            codes_to_remove = [k for k, v in _auth_codes.items() if v.get("type") == "pending"]
+            for k in codes_to_remove:
+                del _auth_codes[k]
+
+
+# ---------------------------------------------------------------------------
+# Token endpoint rate limiting (M1)
+# ---------------------------------------------------------------------------
+
+class TestTokenRateLimit(unittest.TestCase):
+    """Verify /oauth/token rate limiting."""
+
+    def setUp(self):
+        import mcp_oauth
+        mcp_oauth._token_request_timestamps.clear()
+
+    def test_under_limit_passes(self):
+        from mcp_oauth import _check_token_rate_limit
+        for _ in range(30):
+            self.assertTrue(_check_token_rate_limit("test-client-rl"))
+
+    def test_over_limit_blocked(self):
+        from mcp_oauth import _check_token_rate_limit
+        for _ in range(30):
+            _check_token_rate_limit("test-client-rl-2")
+        self.assertFalse(_check_token_rate_limit("test-client-rl-2"))
+
+    def test_different_keys_independent(self):
+        from mcp_oauth import _check_token_rate_limit
+        for _ in range(30):
+            _check_token_rate_limit("client-a")
+        # client-a exhausted, but client-b should be fine
+        self.assertTrue(_check_token_rate_limit("client-b"))
+
+
+# ---------------------------------------------------------------------------
+# Client registration cleanup (M2)
+# ---------------------------------------------------------------------------
+
+class TestClientRegistrationCleanup(unittest.TestCase):
+    """Verify _cleanup_expired_clients removes stale registrations."""
+
+    def test_expired_clients_removed(self):
+        from mcp_oauth import _registered_clients, _cleanup_expired_clients
+        _registered_clients["old-client-cleanup"] = {"created_at": time.time() - 90000}  # >24h
+        _registered_clients["new-client-cleanup"] = {"created_at": time.time()}
+        try:
+            _cleanup_expired_clients()
+            self.assertNotIn("old-client-cleanup", _registered_clients)
+            self.assertIn("new-client-cleanup", _registered_clients)
+        finally:
+            _registered_clients.pop("old-client-cleanup", None)
+            _registered_clients.pop("new-client-cleanup", None)
+
+
+# ---------------------------------------------------------------------------
+# Token response Cache-Control headers (C1-a)
+# ---------------------------------------------------------------------------
+
+class TestTokenResponseHeaders(unittest.TestCase):
+    """Verify token responses include cache-prevention headers."""
+
+    @patch("mcp_oauth.get_token_store")
+    def test_token_response_has_no_store(self, mock_store):
+        from mcp_oauth import oauth_token, _auth_codes
+
+        verifier, challenge = _generate_pkce()
+        auth_code = "cache-control-test-code"
+        _auth_codes[auth_code] = {
+            "type": "code",
+            "client_id": "test-client",
+            "redirect_uri": "http://localhost/callback",
+            "code_challenge": challenge,
+            "sf_access_token": "sf-at",
+            "sf_refresh_token": "sf-rt",
+            "sf_instance_url": "https://myorg.my.salesforce.com",
+            "created_at": time.time(),
+        }
+
+        store_instance = MagicMock()
+        mock_store.return_value = store_instance
+
+        request = MagicMock()
+        request.form = AsyncMock(return_value={
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "code_verifier": verifier,
+            "client_id": "test-client",
+            "redirect_uri": "http://localhost/callback",
+        })
+        request.client = MagicMock()
+        request.client.host = "127.0.0.1"
+
+        result = asyncio.get_event_loop().run_until_complete(oauth_token(request))
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.headers.get("cache-control"), "no-store")
+        self.assertEqual(result.headers.get("pragma"), "no-cache")
+
+        # Clean up
+        from mcp_oauth import _refresh_tokens
+        for rt in list(_refresh_tokens.keys()):
+            del _refresh_tokens[rt]
+
+
+# ---------------------------------------------------------------------------
+# PKCE code_challenge_method required (M9)
+# ---------------------------------------------------------------------------
+
+class TestPKCEMethodRequired(unittest.TestCase):
+    """Verify code_challenge_method is required and cannot be omitted."""
+
+    def test_omitted_challenge_method_rejected(self):
+        from mcp_oauth import oauth_authorize, _registered_clients
+
+        _, challenge = _generate_pkce()
+        client_id = "test-pkce-method"
+        _registered_clients[client_id] = {
+            "redirect_uris": ["http://localhost/callback"],
+            "created_at": time.time(),
+        }
+
+        try:
+            request = _make_request(query_params={
+                "client_id": client_id,
                 "redirect_uri": "http://localhost/callback",
                 "code_challenge": challenge,
-                "code_challenge_method": "S256",
-            },
-        )
-        result = asyncio.get_event_loop().run_until_complete(oauth_authorize(request))
-        self.assertEqual(result.status_code, 307)
-
-        location = dict(result.headers).get("location", "")
-        # SF redirect_uri param should use env var, NOT the spoofed host
-        self.assertNotIn("evil-spoofed-host", location)
-        # Should contain the configured redirect URI from env
-        redirect_uri_encoded = "redirect_uri=" + os.environ.get("SF_OAUTH_REDIRECT_URI", "").replace(":", "%3A").replace("/", "%2F")
-        self.assertIn("redirect_uri=", location)
-
-        # Clean up pending auth codes created by this test
-        codes_to_remove = [k for k, v in _auth_codes.items() if v.get("type") == "pending"]
-        for k in codes_to_remove:
-            del _auth_codes[k]
+                # code_challenge_method intentionally omitted
+            })
+            result = asyncio.get_event_loop().run_until_complete(oauth_authorize(request))
+            self.assertEqual(result.status_code, 400)
+            import json
+            body = json.loads(result.body)
+            self.assertIn("code_challenge_method", body["error_description"])
+        finally:
+            _registered_clients.pop(client_id, None)
 
 
 if __name__ == "__main__":

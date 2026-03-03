@@ -68,6 +68,7 @@ class TokenStore:
 
     def _ensure_dir(self) -> None:
         TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(TOKEN_FILE.parent, 0o700)
 
     def _load(self) -> dict[str, UserTokens]:
         if self._cache is not None:
@@ -91,6 +92,7 @@ class TokenStore:
             os.close(fd)
             fd = -1  # mark as closed
             os.replace(tmp_path, TOKEN_FILE)
+            os.chmod(TOKEN_FILE, 0o600)
         except Exception:
             if fd >= 0:
                 os.close(fd)

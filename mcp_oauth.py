@@ -56,6 +56,13 @@ SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", 86400))
 DCR_MAX_REQUESTS_PER_MINUTE = 10
 _dcr_request_timestamps: dict[str, list[float]] = defaultdict(list)
 
+# Rate limiting for /oauth/token (per-client_id or per-IP sliding window)
+TOKEN_MAX_REQUESTS_PER_MINUTE = 30
+_token_request_timestamps: dict[str, list[float]] = defaultdict(list)
+
+# TTL for registered clients (24 hours)
+CLIENT_REGISTRATION_TTL_SECONDS = 86400
+
 # ---------------------------------------------------------------------------
 # In-memory stores
 # ---------------------------------------------------------------------------
@@ -79,6 +86,17 @@ _ALLOWED_REDIRECT_SCHEMES = ("https", "http")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _token_response(data: dict) -> JSONResponse:
+    """Return a JSON response with cache-prevention headers (RFC 6749 Section 5.1)."""
+    return JSONResponse(
+        data,
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 def _get_server_url(request: Request) -> str:
@@ -109,6 +127,36 @@ def _cleanup_expired_refresh_tokens() -> None:
     expired = [rt for rt, data in _refresh_tokens.items() if now - data["created_at"] > max_age]
     for rt in expired:
         del _refresh_tokens[rt]
+
+
+def _cleanup_expired_clients() -> None:
+    """Remove registered clients older than 24 hours."""
+    now = time.time()
+    expired = [cid for cid, data in _registered_clients.items()
+               if now - data.get("created_at", 0) > CLIENT_REGISTRATION_TTL_SECONDS]
+    for cid in expired:
+        del _registered_clients[cid]
+
+
+_token_rl_call_count = 0
+
+
+def _check_token_rate_limit(key: str) -> bool:
+    """Check rate limit for token endpoint. Returns True if allowed."""
+    global _token_rl_call_count
+    _token_rl_call_count += 1
+    if _token_rl_call_count % 100 == 0:
+        now = time.monotonic()
+        stale = [k for k, v in _token_request_timestamps.items() if not v or now - v[-1] > 60]
+        for k in stale:
+            del _token_request_timestamps[k]
+    now = time.monotonic()
+    window = [t for t in _token_request_timestamps[key] if now - t < 60]
+    if len(window) >= TOKEN_MAX_REQUESTS_PER_MINUTE:
+        return False
+    window.append(now)
+    _token_request_timestamps[key] = window
+    return True
 
 
 def verify_pkce(code_verifier: str, code_challenge: str) -> bool:
@@ -144,15 +192,13 @@ def _validate_redirect_uri(uri: str) -> bool:
 
 def _validate_redirect_uri_for_client(client_id: str, redirect_uri: str) -> bool:
     """
-    Check redirect_uri against DCR-registered URIs (FIX #1: open redirect).
-    If client is registered, redirect_uri must match one of the registered URIs.
-    If client is not registered (public client), just validate the scheme.
+    Check redirect_uri against DCR-registered URIs.
+    All clients MUST be DCR-registered. Unregistered client_ids are rejected.
     """
     client = _registered_clients.get(client_id)
-    if client is not None:
-        return redirect_uri in client["redirect_uris"]
-    # Unregistered client — allow if scheme is valid
-    return _validate_redirect_uri(redirect_uri)
+    if client is None:
+        return False  # Unregistered clients are not allowed
+    return redirect_uri in client["redirect_uris"]
 
 
 def _sanitize_client_name(name: str) -> str:
@@ -248,7 +294,13 @@ async def oauth_authorize(request: Request) -> RedirectResponse | JSONResponse:
             status_code=400,
         )
 
-    if code_challenge_method and code_challenge_method != "S256":
+    if not code_challenge_method:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "code_challenge_method is required (must be S256)"},
+            status_code=400,
+        )
+
+    if code_challenge_method != "S256":
         return JSONResponse(
             {"error": "invalid_request", "error_description": "Only S256 code_challenge_method is supported"},
             status_code=400,
@@ -263,7 +315,7 @@ async def oauth_authorize(request: Request) -> RedirectResponse | JSONResponse:
 
     if not _validate_redirect_uri_for_client(client_id, redirect_uri):
         return JSONResponse(
-            {"error": "invalid_request", "error_description": "redirect_uri does not match registered URIs for this client"},
+            {"error": "invalid_request", "error_description": "Client not registered or redirect_uri mismatch. Use /oauth/register first."},
             status_code=400,
         )
 
@@ -274,6 +326,7 @@ async def oauth_authorize(request: Request) -> RedirectResponse | JSONResponse:
         )
 
     _cleanup_expired_codes()
+    _cleanup_expired_clients()
 
     # FIX #2: Enforce MAX_PENDING_CODES limit
     if len(_auth_codes) >= MAX_PENDING_CODES:
@@ -434,6 +487,14 @@ async def oauth_token(request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    # Rate limit: use client_id if present, otherwise IP
+    rate_key = form.get("client_id", "") or (request.client.host if request.client else "unknown")
+    if not _check_token_rate_limit(rate_key):
+        return JSONResponse(
+            {"error": "rate_limit_exceeded", "error_description": "Too many token requests, try again later"},
+            status_code=429,
+        )
+
     grant_type = form.get("grant_type", "")
 
     if grant_type == "authorization_code":
@@ -527,7 +588,7 @@ async def _handle_authorization_code(form) -> JSONResponse:
 
     logger.info("MCP OAuth: session created via token exchange")
 
-    return JSONResponse({
+    return _token_response({
         "access_token": session_token,
         "token_type": "Bearer",
         "expires_in": SESSION_TTL_SECONDS,
@@ -595,8 +656,8 @@ async def _handle_refresh_token(form) -> JSONResponse:
                         old_tokens["access_token"] = sf_data["access_token"]
                 else:
                     logger.warning("MCP OAuth: SF refresh failed (HTTP %d)", resp.status_code)
-        except Exception as e:
-            logger.warning("MCP OAuth: SF refresh error: %s", type(e).__name__)
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            logger.warning("MCP OAuth: SF refresh error: %s: %s", type(e).__name__, e)
 
     # Re-detect Pardot BUID if missing (e.g., session created before auto-detect)
     pardot_buid = old_tokens.get("pardot_business_unit_id")
@@ -630,7 +691,7 @@ async def _handle_refresh_token(form) -> JSONResponse:
 
     logger.info("MCP OAuth: session refreshed")
 
-    return JSONResponse({
+    return _token_response({
         "access_token": new_session_token,
         "token_type": "Bearer",
         "expires_in": SESSION_TTL_SECONDS,
@@ -689,6 +750,9 @@ async def oauth_register(request: Request) -> JSONResponse:
                  "error_description": "Invalid redirect_uri: must use https (or http://localhost for development)"},
                 status_code=400,
             )
+
+    # Clean up expired clients before checking capacity
+    _cleanup_expired_clients()
 
     # FIX #3: Enforce MAX_REGISTERED_CLIENTS limit
     if len(_registered_clients) >= MAX_REGISTERED_CLIENTS:

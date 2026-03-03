@@ -9,6 +9,7 @@ Each user connects their own Salesforce org via MCP OAuth 2.1.
 Pardot tools use the authenticated user's access token and Business Unit ID.
 """
 
+import asyncio
 import os
 import time
 import logging
@@ -19,7 +20,7 @@ from pydantic import Field
 from fastmcp.exceptions import ToolError
 
 from user_context import get_current_api_key
-from token_store import get_token_store
+from token_store import get_token_store, _hash_key as _cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,20 @@ def _warn_large_result(tool_name: str, count: int) -> None:
             "Large result set from %s: %d records returned (threshold: %d)",
             tool_name, count, LARGE_RESULT_THRESHOLD,
         )
+
+
+def _safe_error(text: str, max_len: int = 200) -> str:
+    """Truncate error response text to prevent leaking org details."""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "... [truncated]"
+
+
+def _validate_numeric_id(value: str, name: str) -> int:
+    """Validate that value is a numeric string and return it as int. Prevents path injection."""
+    if not value or not value.strip().isdigit():
+        raise ToolError(f"Invalid {name}: must be a numeric ID, got {value!r}")
+    return int(value.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +159,7 @@ class PardotClient:
                 resp.raise_for_status()
                 return resp.json()
             raise ToolError(
-                f"Pardot API error {exc.response.status_code}: {exc.response.text}"
+                f"Pardot API error {exc.response.status_code}: {_safe_error(exc.response.text)}"
             )
         except httpx.RequestError as exc:
             raise ToolError(f"Pardot API request failed: {exc}")
@@ -165,7 +180,7 @@ class PardotClient:
                 resp.raise_for_status()
                 return resp.json()
             raise ToolError(
-                f"Pardot API error {exc.response.status_code}: {exc.response.text}"
+                f"Pardot API error {exc.response.status_code}: {_safe_error(exc.response.text)}"
             )
         except httpx.RequestError as exc:
             raise ToolError(f"Pardot API request failed: {exc}")
@@ -186,7 +201,7 @@ class PardotClient:
                 resp.raise_for_status()
                 return resp.json()
             raise ToolError(
-                f"Pardot API error {exc.response.status_code}: {exc.response.text}"
+                f"Pardot API error {exc.response.status_code}: {_safe_error(exc.response.text)}"
             )
         except httpx.RequestError as exc:
             raise ToolError(f"Pardot API request failed: {exc}")
@@ -200,15 +215,28 @@ _pardot_clients: dict[str, tuple[PardotClient, float]] = {}
 _MAX_PARDOT_CLIENTS = 50
 
 
+def _close_pardot_http_client(pardot_client: PardotClient) -> None:
+    """Schedule async close of a PardotClient's httpx client."""
+    if pardot_client._http_client and not pardot_client._http_client.is_closed:
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(pardot_client._http_client.aclose())
+        except RuntimeError:
+            pass  # No event loop available; client will be GC'd
+
+
 def get_pardot_client() -> PardotClient:
     """Get per-user Pardot client based on current request context."""
     api_key = get_current_api_key()
     if not api_key:
         raise ToolError("No authenticated session. Please connect via MCP OAuth.")
 
+    # Use HMAC-hashed key for cache (prevents raw token exposure in memory dumps)
+    hk = _cache_key(api_key)
+
     now = time.monotonic()
-    if api_key in _pardot_clients:
-        client, created = _pardot_clients[api_key]
+    if hk in _pardot_clients:
+        client, created = _pardot_clients[hk]
         if (now - created) < TOKEN_TTL_SECONDS:
             return client
 
@@ -216,13 +244,15 @@ def get_pardot_client() -> PardotClient:
     if len(_pardot_clients) >= _MAX_PARDOT_CLIENTS:
         expired = [k for k, (_, t) in _pardot_clients.items() if (now - t) >= TOKEN_TTL_SECONDS]
         for k in expired:
+            _close_pardot_http_client(_pardot_clients[k][0])
             del _pardot_clients[k]
         if len(_pardot_clients) >= _MAX_PARDOT_CLIENTS:
             oldest_key = min(_pardot_clients, key=lambda k: _pardot_clients[k][1])
+            _close_pardot_http_client(_pardot_clients[oldest_key][0])
             del _pardot_clients[oldest_key]
 
     client = PardotClient(api_key=api_key)
-    _pardot_clients[api_key] = (client, now)
+    _pardot_clients[hk] = (client, now)
     return client
 
 
@@ -316,8 +346,9 @@ async def pardot_update_prospect(
     client = get_pardot_client()
     if not prospect_id or not fields:
         raise ToolError("Both prospect_id and fields are required")
+    pid = _validate_numeric_id(prospect_id, "prospect_id")
     _check_blocked_prospect_fields(fields)
-    result = await client.patch(f"prospects/{prospect_id}", json_body=fields)
+    result = await client.patch(f"prospects/{pid}", json_body=fields)
     return {"success": True, "prospect": result}
 
 
@@ -354,7 +385,8 @@ async def pardot_add_prospect_to_list(
     client = get_pardot_client()
     if not prospect_id or not list_id:
         raise ToolError("Both prospect_id and list_id are required")
-    body = {"prospectId": int(prospect_id), "listId": int(list_id)}
+    body = {"prospectId": _validate_numeric_id(prospect_id, "prospect_id"),
+            "listId": _validate_numeric_id(list_id, "list_id")}
     result = await client.post("list-memberships", json_body=body)
     return {"success": True, "membership": result}
 
@@ -376,6 +408,7 @@ async def pardot_get_visitor_activities(
         "fields": "id,prospectId,type,typeName,details,campaignId,createdAt",
     }
     if prospect_id:
+        _validate_numeric_id(prospect_id, "prospect_id")
         params["prospectId"] = prospect_id
     if activity_type is not None:
         params["type"] = str(activity_type)
@@ -418,6 +451,7 @@ async def pardot_get_lifecycle_history(
     prospect_id: Annotated[str, Field(description="Pardot prospect ID to get lifecycle history for")],
 ) -> dict:
     """Get lifecycle stage progression history for a Pardot prospect."""
+    _validate_numeric_id(prospect_id, "prospect_id")
     client = get_pardot_client()
     # Pardot API v5 lifecycle-histories endpoint does NOT support prospectId
     # as a query parameter — only id and createdAt filters are available.

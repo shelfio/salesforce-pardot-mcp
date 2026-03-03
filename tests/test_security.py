@@ -962,5 +962,187 @@ class TestOutputSanitization(unittest.TestCase):
         self.assertNotIn("warning", result)
 
 
+# ---------------------------------------------------------------------------
+# 25. Case-insensitive blocked fields (H7)
+# ---------------------------------------------------------------------------
+
+class TestBlockedFieldsCaseInsensitive(unittest.TestCase):
+    """Verify blocked fields check is case-insensitive."""
+
+    def test_lowercase_owner_id_blocked(self):
+        from tools.salesforce import _check_blocked_fields, BLOCKED_LEAD_FIELDS
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _check_blocked_fields({"ownerid": "005xxx"}, BLOCKED_LEAD_FIELDS, "Lead")
+
+    def test_uppercase_owner_id_blocked(self):
+        from tools.salesforce import _check_blocked_fields, BLOCKED_LEAD_FIELDS
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _check_blocked_fields({"OWNERID": "005xxx"}, BLOCKED_LEAD_FIELDS, "Lead")
+
+    def test_mixed_case_is_converted_blocked(self):
+        from tools.salesforce import _check_blocked_fields, BLOCKED_LEAD_FIELDS
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _check_blocked_fields({"isConverted": True}, BLOCKED_LEAD_FIELDS, "Lead")
+
+    def test_normal_field_allowed(self):
+        from tools.salesforce import _check_blocked_fields, BLOCKED_LEAD_FIELDS
+        # Should not raise
+        _check_blocked_fields({"Status": "Working", "Company": "Acme"}, BLOCKED_LEAD_FIELDS, "Lead")
+
+    def test_contact_blocked_case_insensitive(self):
+        from tools.salesforce import _check_blocked_fields, BLOCKED_CONTACT_FIELDS
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _check_blocked_fields({"masterrecordid": "003xxx"}, BLOCKED_CONTACT_FIELDS, "Contact")
+
+
+# ---------------------------------------------------------------------------
+# 26. sf_create_lead blocked fields check (L4)
+# ---------------------------------------------------------------------------
+
+class TestCreateLeadBlockedFields(unittest.TestCase):
+    """Verify sf_create_lead rejects blocked fields."""
+
+    @patch("tools.salesforce.get_sf_client")
+    def test_owner_id_blocked_in_create(self, mock_get_client):
+        from tools.salesforce import sf_create_lead
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError) as ctx:
+            sf_create_lead(fields={"LastName": "Doe", "Company": "Acme", "OwnerId": "005xxx"})
+        self.assertIn("protected", str(ctx.exception).lower())
+
+    @patch("tools.salesforce.get_sf_client")
+    def test_lowercase_owner_id_blocked_in_create(self, mock_get_client):
+        from tools.salesforce import sf_create_lead
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            sf_create_lead(fields={"LastName": "Doe", "Company": "Acme", "ownerid": "005xxx"})
+
+    @patch("tools.salesforce.get_sf_client")
+    def test_valid_create_passes(self, mock_get_client):
+        mock_sf = MagicMock()
+        mock_sf.Lead.create.return_value = {"success": True, "id": "00Qxx", "errors": []}
+        mock_get_client.return_value = mock_sf
+
+        from tools.salesforce import sf_create_lead
+        result = sf_create_lead(fields={"LastName": "Doe", "Company": "Acme"})
+        self.assertTrue(result["success"])
+
+
+# ---------------------------------------------------------------------------
+# 27. Error response truncation (M3)
+# ---------------------------------------------------------------------------
+
+class TestSafeError(unittest.TestCase):
+    """Verify error message truncation."""
+
+    def test_short_message_unchanged(self):
+        from tools.salesforce import _safe_error
+        self.assertEqual(_safe_error("short error"), "short error")
+
+    def test_long_message_truncated(self):
+        from tools.salesforce import _safe_error
+        long_msg = "A" * 500
+        result = _safe_error(long_msg)
+        self.assertTrue(result.endswith("... [truncated]"))
+        self.assertEqual(len(result), 200 + len("... [truncated]"))
+
+    def test_exact_boundary_unchanged(self):
+        from tools.salesforce import _safe_error
+        msg = "B" * 200
+        self.assertEqual(_safe_error(msg), msg)
+
+    def test_one_over_boundary_truncated(self):
+        from tools.salesforce import _safe_error
+        msg = "C" * 201
+        result = _safe_error(msg)
+        self.assertTrue(result.endswith("... [truncated]"))
+
+
+# ---------------------------------------------------------------------------
+# 28. Pardot numeric ID validation (H5)
+# ---------------------------------------------------------------------------
+
+class TestPardotIdValidation(unittest.TestCase):
+    """Verify prospect_id and list_id validation."""
+
+    def test_valid_numeric_id(self):
+        from tools.pardot import _validate_numeric_id
+        self.assertEqual(_validate_numeric_id("12345", "prospect_id"), 12345)
+
+    def test_non_numeric_rejected(self):
+        from tools.pardot import _validate_numeric_id
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _validate_numeric_id("abc", "prospect_id")
+
+    def test_path_traversal_rejected(self):
+        from tools.pardot import _validate_numeric_id
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _validate_numeric_id("123/../campaigns/456", "prospect_id")
+
+    def test_empty_rejected(self):
+        from tools.pardot import _validate_numeric_id
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _validate_numeric_id("", "prospect_id")
+
+    def test_negative_rejected(self):
+        from tools.pardot import _validate_numeric_id
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            _validate_numeric_id("-1", "prospect_id")
+
+    def test_whitespace_trimmed(self):
+        from tools.pardot import _validate_numeric_id
+        self.assertEqual(_validate_numeric_id("  789  ", "list_id"), 789)
+
+
+# ---------------------------------------------------------------------------
+# 29. Pardot error truncation (M3-b)
+# ---------------------------------------------------------------------------
+
+class TestPardotSafeError(unittest.TestCase):
+    """Verify Pardot error message truncation."""
+
+    def test_pardot_safe_error_truncates(self):
+        from tools.pardot import _safe_error
+        long_msg = "X" * 500
+        result = _safe_error(long_msg)
+        self.assertTrue(result.endswith("... [truncated]"))
+        self.assertEqual(len(result), 200 + len("... [truncated]"))
+
+
+# ---------------------------------------------------------------------------
+# 30. OAuth env var validation (M4)
+# ---------------------------------------------------------------------------
+
+class TestOAuthEnvVarValidation(unittest.TestCase):
+    """Verify _validate_oauth_env_vars fails fast on missing credentials."""
+
+    @patch.dict(os.environ, {"SF_OAUTH_CLIENT_ID": "", "SF_OAUTH_CLIENT_SECRET": ""})
+    def test_empty_vars_raises(self):
+        # Need to reload module to pick up new env vars
+        import importlib
+        import oauth
+        importlib.reload(oauth)
+        with self.assertRaises(RuntimeError) as ctx:
+            oauth._validate_oauth_env_vars()
+        self.assertIn("SF_OAUTH_CLIENT_ID", str(ctx.exception))
+        self.assertIn("SF_OAUTH_CLIENT_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, {"SF_OAUTH_CLIENT_ID": "test-id", "SF_OAUTH_CLIENT_SECRET": "test-secret"})
+    def test_valid_vars_passes(self):
+        import importlib
+        import oauth
+        importlib.reload(oauth)
+        # Should not raise
+        oauth._validate_oauth_env_vars()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,8 @@ from simple_salesforce import Salesforce, SalesforceError
 from fastmcp.exceptions import ToolError
 
 from user_context import get_current_api_key
-from token_store import get_token_store
+from token_store import get_token_store, _hash_key as _cache_key
+from oauth import _validate_instance_url
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +45,13 @@ def _get_oauth_sf_client(api_key: str) -> Salesforce:
     if tokens is None:
         raise ToolError("No Salesforce tokens found for this session. Please reconnect via OAuth.")
 
+    # Use HMAC-hashed key for cache (prevents raw token exposure in memory dumps)
+    hk = _cache_key(api_key)
+
     # Check cache
     now = _time.monotonic()
-    if api_key in _sf_clients:
-        client, created = _sf_clients[api_key]
+    if hk in _sf_clients:
+        client, created = _sf_clients[hk]
         if (now - created) < _CLIENT_TTL:
             return client
 
@@ -67,7 +71,7 @@ def _get_oauth_sf_client(api_key: str) -> Salesforce:
             instance_url=tokens["instance_url"],
             session_id=tokens["access_token"],
         )
-        _sf_clients[api_key] = (client, now)
+        _sf_clients[hk] = (client, now)
         logger.info("Per-user SF client created (instance: %s)", tokens["instance_url"])
         return client
     except Exception as exc:
@@ -89,8 +93,10 @@ def get_sf_client() -> Salesforce:
 def reset_sf_client() -> None:
     """Force re-initialization on next call (e.g. after session expiry)."""
     api_key = get_current_api_key()
-    if api_key and api_key in _sf_clients:
-        del _sf_clients[api_key]
+    if api_key:
+        hk = _cache_key(api_key)
+        if hk in _sf_clients:
+            del _sf_clients[hk]
 
 
 def _refresh_oauth_token(tokens: dict) -> dict | None:
@@ -108,11 +114,15 @@ def _refresh_oauth_token(tokens: dict) -> dict | None:
         )
         if resp.status_code == 200:
             data = resp.json()
+            new_instance_url = data.get("instance_url", tokens["instance_url"])
+            if not _validate_instance_url(new_instance_url):
+                logger.warning("OAuth refresh returned invalid instance_url: %s", new_instance_url[:50])
+                new_instance_url = tokens["instance_url"]
             import time
             return {
                 "access_token": data["access_token"],
                 "refresh_token": tokens["refresh_token"],  # SF doesn't rotate refresh tokens
-                "instance_url": data["instance_url"],
+                "instance_url": new_instance_url,
                 "issued_at": time.time(),
                 "pardot_business_unit_id": tokens.get("pardot_business_unit_id"),
             }
@@ -191,20 +201,27 @@ def _validate_select_only(soql: str) -> None:
         raise ToolError("Only SELECT queries are allowed via sf_query")
 
 
-# Sensitive fields that cannot be changed through update tools
+# Sensitive fields that cannot be changed through update/create tools (lowercase for case-insensitive check)
 BLOCKED_LEAD_FIELDS: frozenset[str] = frozenset(
-    {"OwnerId", "IsConverted", "IsDeleted", "MasterRecordId"}
+    {"ownerid", "isconverted", "isdeleted", "masterrecordid"}
 )
 BLOCKED_CONTACT_FIELDS: frozenset[str] = frozenset(
-    {"OwnerId", "IsDeleted", "MasterRecordId"}
+    {"ownerid", "isdeleted", "masterrecordid"}
 )
 
 
 def _check_blocked_fields(fields: dict, blocked: frozenset[str], object_name: str) -> None:
-    """Raise ToolError if any field key is in the blocked set."""
-    found = set(fields.keys()) & blocked
+    """Raise ToolError if any field key is in the blocked set (case-insensitive)."""
+    found = {k for k in fields if k.lower() in blocked}
     if found:
         raise ToolError(f"Cannot update protected {object_name} fields: {found}")
+
+
+def _safe_error(text: str, max_len: int = 200) -> str:
+    """Truncate error response text to prevent leaking org details."""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "... [truncated]"
 
 
 def _safe_query(sf: Salesforce, soql: str) -> dict:
@@ -244,7 +261,7 @@ def sf_query(
         _warn_large_result("sf_query", result["totalSize"])
         return _sanitize_result(result["records"], result["totalSize"], "sf_query")
     except SalesforceError as exc:
-        raise ToolError(f"SOQL query failed: {exc}")
+        raise ToolError(f"SOQL query failed: {_safe_error(str(exc))}")
 
 
 def sf_get_leads(
@@ -280,7 +297,7 @@ def sf_get_leads(
         _warn_large_result("sf_get_leads", result["totalSize"])
         return _sanitize_result(result["records"], result["totalSize"], "sf_get_leads")
     except SalesforceError as exc:
-        raise ToolError(f"Failed to get leads: {exc}")
+        raise ToolError(f"Failed to get leads: {_safe_error(str(exc))}")
 
 
 def sf_get_contacts(
@@ -313,7 +330,7 @@ def sf_get_contacts(
         _warn_large_result("sf_get_contacts", result["totalSize"])
         return _sanitize_result(result["records"], result["totalSize"], "sf_get_contacts")
     except SalesforceError as exc:
-        raise ToolError(f"Failed to get contacts: {exc}")
+        raise ToolError(f"Failed to get contacts: {_safe_error(str(exc))}")
 
 
 def sf_update_lead(
@@ -341,7 +358,7 @@ def sf_update_lead(
             "updated_fields": list(fields.keys()),
         }
     except SalesforceError as exc:
-        raise ToolError(f"Failed to update lead {lead_id}: {exc}")
+        raise ToolError(f"Failed to update lead {lead_id}: {_safe_error(str(exc))}")
 
 
 def sf_update_contact(
@@ -364,7 +381,7 @@ def sf_update_contact(
             "updated_fields": list(fields.keys()),
         }
     except SalesforceError as exc:
-        raise ToolError(f"Failed to update contact {contact_id}: {exc}")
+        raise ToolError(f"Failed to update contact {contact_id}: {_safe_error(str(exc))}")
 
 
 def sf_create_lead(
@@ -382,6 +399,7 @@ def sf_create_lead(
     sf = get_sf_client()
     if "LastName" not in fields or "Company" not in fields:
         raise ToolError("fields must include 'LastName' and 'Company' at minimum")
+    _check_blocked_fields(fields, BLOCKED_LEAD_FIELDS, "Lead")
     try:
         result = sf.Lead.create(fields)
         return {
@@ -390,7 +408,7 @@ def sf_create_lead(
             "errors": result.get("errors", []),
         }
     except SalesforceError as exc:
-        raise ToolError(f"Failed to create lead: {exc}")
+        raise ToolError(f"Failed to create lead: {_safe_error(str(exc))}")
 
 
 def sf_pipeline_report(
@@ -425,7 +443,7 @@ def sf_pipeline_report(
         ]
         return {"stages": stages}
     except SalesforceError as exc:
-        raise ToolError(f"Pipeline report failed: {exc}")
+        raise ToolError(f"Pipeline report failed: {_safe_error(str(exc))}")
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +492,7 @@ def sf_get_tasks(
         _warn_large_result("sf_get_tasks", result["totalSize"])
         return _sanitize_result(result["records"], result["totalSize"], "sf_get_tasks")
     except SalesforceError as exc:
-        raise ToolError(f"Failed to get tasks: {exc}")
+        raise ToolError(f"Failed to get tasks: {_safe_error(str(exc))}")
 
 
 def sf_get_events(
@@ -512,7 +530,7 @@ def sf_get_events(
         _warn_large_result("sf_get_events", result["totalSize"])
         return _sanitize_result(result["records"], result["totalSize"], "sf_get_events")
     except SalesforceError as exc:
-        raise ToolError(f"Failed to get events: {exc}")
+        raise ToolError(f"Failed to get events: {_safe_error(str(exc))}")
 
 
 def sf_get_activity_history(
@@ -574,4 +592,4 @@ def sf_get_activity_history(
             result["warning"] = f"Activities truncated to {MAX_RESULT_RECORDS} records."
         return result
     except SalesforceError as exc:
-        raise ToolError(f"Failed to get activity history: {exc}")
+        raise ToolError(f"Failed to get activity history: {_safe_error(str(exc))}")
