@@ -5,8 +5,8 @@ Provides prospect, campaign, list, form, visitor activity, email, and
 lifecycle history operations via async HTTP calls. Token caching with
 55-minute TTL avoids re-authenticating on every request.
 
-Supports multi-tenant mode: when a user has connected their own Salesforce
-account via OAuth, Pardot tools use their access token and Business Unit ID.
+Each user connects their own Salesforce org via MCP OAuth 2.1.
+Pardot tools use the authenticated user's access token and Business Unit ID.
 """
 
 import os
@@ -49,17 +49,15 @@ class PardotClient:
     """
     Async HTTP client for Pardot API v5.
 
-    In legacy mode, obtains its access token from the shared Salesforce
-    client's ``session_id``. In multi-tenant mode, uses per-user OAuth
-    tokens from the token store. On 401 responses the cached token is
-    invalidated and the request is retried once.
+    Uses per-user OAuth tokens from the token store. On 401 responses
+    the cached token is invalidated and the request is retried once.
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(self, api_key: str) -> None:
         self._token: str | None = None
         self._token_acquired_at: float = 0.0
         self._http_client: httpx.AsyncClient | None = None
-        self._api_key = api_key  # None = legacy mode
+        self._api_key = api_key
 
     # -- Token management ---------------------------------------------------
 
@@ -69,33 +67,16 @@ class PardotClient:
         return (time.monotonic() - self._token_acquired_at) < TOKEN_TTL_SECONDS
 
     def _refresh_token(self) -> str:
-        """
-        Get a fresh access token.
-
-        Per-user mode: reads from token store.
-        Legacy mode: reads from shared Salesforce client session_id.
-        """
-        # Try per-user OAuth tokens first
+        """Get a fresh access token from the OAuth token store."""
         store = get_token_store()
-        if self._api_key and store:
+        if store:
             tokens = store.get(self._api_key)
             if tokens:
                 self._token = tokens["access_token"]
                 self._token_acquired_at = time.monotonic()
                 logger.info("Pardot token refreshed from OAuth store (TTL: %d min)", TOKEN_TTL_SECONDS // 60)
                 return self._token
-
-        # Fallback to legacy: get token from shared SF client
-        from tools.salesforce import get_sf_client
-
-        sf = get_sf_client()
-        token = sf.session_id
-        if not token:
-            raise ToolError("Could not obtain access token from Salesforce client")
-        self._token = token
-        self._token_acquired_at = time.monotonic()
-        logger.info("Pardot access token refreshed from legacy SF (TTL: %d min)", TOKEN_TTL_SECONDS // 60)
-        return token
+        raise ToolError("No Salesforce tokens found for this session. Please reconnect via OAuth.")
 
     def _get_token(self) -> str:
         if not self._token_is_valid():
@@ -212,43 +193,37 @@ class PardotClient:
 
 
 # ---------------------------------------------------------------------------
-# Client management (per-user + legacy singleton)
+# Client management (per-user via OAuth)
 # ---------------------------------------------------------------------------
 
 _pardot_clients: dict[str, tuple[PardotClient, float]] = {}
-_pardot_client_legacy: PardotClient | None = None
 _MAX_PARDOT_CLIENTS = 50
 
 
 def get_pardot_client() -> PardotClient:
-    """Get per-user or legacy Pardot client based on current request context."""
-    global _pardot_client_legacy
+    """Get per-user Pardot client based on current request context."""
     api_key = get_current_api_key()
+    if not api_key:
+        raise ToolError("No authenticated session. Please connect via MCP OAuth.")
 
-    if api_key:
-        store = get_token_store()
-        if store and store.has_tokens(api_key):
-            now = time.monotonic()
-            if api_key in _pardot_clients:
-                client, created = _pardot_clients[api_key]
-                if (now - created) < TOKEN_TTL_SECONDS:
-                    return client
-            # Evict expired entries before adding
-            if len(_pardot_clients) >= _MAX_PARDOT_CLIENTS:
-                expired = [k for k, (_, t) in _pardot_clients.items() if (now - t) >= TOKEN_TTL_SECONDS]
-                for k in expired:
-                    del _pardot_clients[k]
-                if len(_pardot_clients) >= _MAX_PARDOT_CLIENTS:
-                    oldest_key = min(_pardot_clients, key=lambda k: _pardot_clients[k][1])
-                    del _pardot_clients[oldest_key]
-            client = PardotClient(api_key=api_key)
-            _pardot_clients[api_key] = (client, now)
+    now = time.monotonic()
+    if api_key in _pardot_clients:
+        client, created = _pardot_clients[api_key]
+        if (now - created) < TOKEN_TTL_SECONDS:
             return client
 
-    # Legacy singleton
-    if _pardot_client_legacy is None:
-        _pardot_client_legacy = PardotClient()
-    return _pardot_client_legacy
+    # Evict expired entries before adding
+    if len(_pardot_clients) >= _MAX_PARDOT_CLIENTS:
+        expired = [k for k, (_, t) in _pardot_clients.items() if (now - t) >= TOKEN_TTL_SECONDS]
+        for k in expired:
+            del _pardot_clients[k]
+        if len(_pardot_clients) >= _MAX_PARDOT_CLIENTS:
+            oldest_key = min(_pardot_clients, key=lambda k: _pardot_clients[k][1])
+            del _pardot_clients[oldest_key]
+
+    client = PardotClient(api_key=api_key)
+    _pardot_clients[api_key] = (client, now)
+    return client
 
 
 # ---------------------------------------------------------------------------

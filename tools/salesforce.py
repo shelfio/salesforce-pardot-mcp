@@ -5,9 +5,8 @@ Provides SOQL queries, lead/contact CRUD, pipeline reporting, and activity
 history via the simple-salesforce library. All tools are synchronous —
 FastMCP runs them in a threadpool so they don't block the event loop.
 
-Supports multi-tenant mode: when a user has connected their own Salesforce
-account via OAuth, tools automatically use their credentials and permissions.
-Falls back to shared env-var credentials (legacy mode) otherwise.
+Each user connects their own Salesforce org via MCP OAuth 2.1.
+Tools automatically use the authenticated user's credentials and permissions.
 """
 
 import os
@@ -28,36 +27,13 @@ from token_store import get_token_store
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Salesforce client management (per-user + legacy singleton)
+# Salesforce client management (per-user via OAuth)
 # ---------------------------------------------------------------------------
 
 # Per-user cache: api_key -> (Salesforce client, created_monotonic)
 _sf_clients: dict[str, tuple[Salesforce, float]] = {}
 _CLIENT_TTL = 55 * 60  # 55 minutes
 _MAX_CACHED_CLIENTS = 50  # max per-user clients in memory
-
-# Legacy singleton (backward compatibility when no OAuth tokens exist)
-_sf_client_legacy: Salesforce | None = None
-
-
-def _get_legacy_sf_client() -> Salesforce:
-    """Original singleton logic: shared credentials from env vars."""
-    global _sf_client_legacy
-    if _sf_client_legacy is None:
-        try:
-            _sf_client_legacy = Salesforce(
-                username=os.environ["SF_USERNAME"],
-                password=os.environ["SF_PASSWORD"],
-                security_token=os.environ.get("SF_SECURITY_TOKEN", ""),
-                consumer_key=os.environ.get("SF_CLIENT_ID", ""),
-                consumer_secret=os.environ.get("SF_CLIENT_SECRET", ""),
-                domain=os.environ.get("SF_DOMAIN", "login"),
-            )
-            logger.info("Legacy SF client initialized (instance: %s)", _sf_client_legacy.sf_instance)
-        except Exception as exc:
-            logger.error("Salesforce authentication failed: %s", exc)
-            raise ToolError(f"Salesforce authentication failed: {exc}")
-    return _sf_client_legacy
 
 
 def _get_oauth_sf_client(api_key: str) -> Salesforce:
@@ -66,7 +42,7 @@ def _get_oauth_sf_client(api_key: str) -> Salesforce:
     tokens = store.get(api_key) if store else None
 
     if tokens is None:
-        return _get_legacy_sf_client()
+        raise ToolError("No Salesforce tokens found for this session. Please reconnect via OAuth.")
 
     # Check cache
     now = _time.monotonic()
@@ -95,30 +71,26 @@ def _get_oauth_sf_client(api_key: str) -> Salesforce:
         logger.info("Per-user SF client created (instance: %s)", tokens["instance_url"])
         return client
     except Exception as exc:
-        raise ToolError(f"Salesforce OAuth client creation failed: {exc}")
+        raise ToolError(f"Salesforce client creation failed: {type(exc).__name__}")
 
 
 def get_sf_client() -> Salesforce:
     """
-    Get the appropriate Salesforce client for the current request.
+    Get the Salesforce client for the current request.
 
-    - If the current API key has stored OAuth tokens -> per-user client
-    - Otherwise -> shared legacy client (env var credentials)
+    Uses the authenticated user's OAuth tokens to create a per-user client.
     """
     api_key = get_current_api_key()
-    if api_key:
-        return _get_oauth_sf_client(api_key)
-    return _get_legacy_sf_client()
+    if not api_key:
+        raise ToolError("No authenticated session. Please connect via MCP OAuth.")
+    return _get_oauth_sf_client(api_key)
 
 
 def reset_sf_client() -> None:
     """Force re-initialization on next call (e.g. after session expiry)."""
-    global _sf_client_legacy
     api_key = get_current_api_key()
     if api_key and api_key in _sf_clients:
         del _sf_clients[api_key]
-    else:
-        _sf_client_legacy = None
 
 
 def _refresh_oauth_token(tokens: dict) -> dict | None:
@@ -145,7 +117,7 @@ def _refresh_oauth_token(tokens: dict) -> dict | None:
                 "pardot_business_unit_id": tokens.get("pardot_business_unit_id"),
             }
     except Exception as e:
-        logger.error("OAuth token refresh failed: %s", e)
+        logger.error("OAuth token refresh failed: %s", type(e).__name__)
     return None
 
 

@@ -179,48 +179,6 @@ class TestKeyFingerprint(unittest.TestCase):
         self.assertEqual(_key_fingerprint(key), expected)
 
 
-class TestLoadApiKeys(unittest.TestCase):
-    """Tests for auth._load_api_keys"""
-
-    def test_parses_comma_separated(self):
-        from auth import _load_api_keys
-        with patch.dict(os.environ, {"TEAM_API_KEYS": "key1,key2,key3"}):
-            keys = _load_api_keys()
-            self.assertEqual(keys, {"key1", "key2", "key3"})
-
-    def test_strips_whitespace(self):
-        from auth import _load_api_keys
-        with patch.dict(os.environ, {"TEAM_API_KEYS": " key1 , key2 , key3 "}):
-            keys = _load_api_keys()
-            self.assertEqual(keys, {"key1", "key2", "key3"})
-
-    def test_empty_env_var(self):
-        from auth import _load_api_keys
-        with patch.dict(os.environ, {"TEAM_API_KEYS": ""}):
-            keys = _load_api_keys()
-            self.assertEqual(keys, set())
-
-    def test_missing_env_var(self):
-        from auth import _load_api_keys
-        env = os.environ.copy()
-        env.pop("TEAM_API_KEYS", None)
-        with patch.dict(os.environ, env, clear=True):
-            keys = _load_api_keys()
-            self.assertEqual(keys, set())
-
-    def test_single_key(self):
-        from auth import _load_api_keys
-        with patch.dict(os.environ, {"TEAM_API_KEYS": "only-one-key"}):
-            keys = _load_api_keys()
-            self.assertEqual(keys, {"only-one-key"})
-
-    def test_ignores_empty_segments(self):
-        from auth import _load_api_keys
-        with patch.dict(os.environ, {"TEAM_API_KEYS": "key1,,key2,,,key3"}):
-            keys = _load_api_keys()
-            self.assertEqual(keys, {"key1", "key2", "key3"})
-
-
 # ---------------------------------------------------------------------------
 # 5. Rate limiting
 # ---------------------------------------------------------------------------
@@ -376,26 +334,26 @@ class TestPardotTokenTTL(unittest.TestCase):
 
     def test_no_token_initially(self):
         from tools.pardot import PardotClient
-        client = PardotClient()
+        client = PardotClient("test-key")
         self.assertFalse(client._token_is_valid())
 
     def test_token_valid_after_set(self):
         from tools.pardot import PardotClient
-        client = PardotClient()
+        client = PardotClient("test-key")
         client._token = "test-token"
         client._token_acquired_at = time.monotonic()
         self.assertTrue(client._token_is_valid())
 
     def test_token_expired_after_ttl(self):
         from tools.pardot import PardotClient, TOKEN_TTL_SECONDS
-        client = PardotClient()
+        client = PardotClient("test-key")
         client._token = "test-token"
         client._token_acquired_at = time.monotonic() - TOKEN_TTL_SECONDS - 1
         self.assertFalse(client._token_is_valid())
 
     def test_invalidate_clears_token(self):
         from tools.pardot import PardotClient
-        client = PardotClient()
+        client = PardotClient("test-key")
         client._token = "test-token"
         client._token_acquired_at = time.monotonic()
         client._invalidate_token()
@@ -667,28 +625,14 @@ class TestTokenStore(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestPerUserClientRouting(unittest.TestCase):
-    """Verify get_sf_client routes to legacy or per-user client."""
+    """Verify get_sf_client routes to per-user client via OAuth tokens."""
 
     @patch("tools.salesforce.get_current_api_key", return_value=None)
-    @patch("tools.salesforce._get_legacy_sf_client")
-    def test_no_api_key_uses_legacy(self, mock_legacy, mock_key):
+    def test_no_api_key_raises(self, mock_key):
         from tools.salesforce import get_sf_client
-        mock_legacy.return_value = MagicMock()
-        client = get_sf_client()
-        mock_legacy.assert_called_once()
-
-    @patch("tools.salesforce.get_token_store")
-    @patch("tools.salesforce.get_current_api_key", return_value="user-key-1")
-    @patch("tools.salesforce._get_legacy_sf_client")
-    def test_api_key_without_tokens_uses_legacy(self, mock_legacy, mock_key, mock_store):
-        from tools.salesforce import get_sf_client
-        mock_store_instance = MagicMock()
-        mock_store_instance.get.return_value = None
-        mock_store.return_value = mock_store_instance
-        mock_legacy.return_value = MagicMock()
-
-        client = get_sf_client()
-        mock_legacy.assert_called_once()
+        from fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError):
+            get_sf_client()
 
 
 # ---------------------------------------------------------------------------
@@ -762,38 +706,11 @@ class TestInstanceUrlValidation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 18. Pending states TTL and max size
+# 18. Auth middleware
 # ---------------------------------------------------------------------------
 
-class TestPendingStatesSecurity(unittest.TestCase):
-    """Verify _pending_states TTL cleanup and max size limit."""
-
-    def test_expired_states_cleaned_up(self):
-        import oauth
-        oauth._pending_states.clear()
-        # Add an expired state (now stores just timestamp, not tuple)
-        oauth._pending_states["old-state"] = time.time() - 700
-        oauth._cleanup_expired_states()
-        self.assertNotIn("old-state", oauth._pending_states)
-
-    def test_fresh_states_preserved(self):
-        import oauth
-        oauth._pending_states.clear()
-        oauth._pending_states["fresh-state"] = time.time()
-        oauth._cleanup_expired_states()
-        self.assertIn("fresh-state", oauth._pending_states)
-
-    def tearDown(self):
-        import oauth
-        oauth._pending_states.clear()
-
-
-# ---------------------------------------------------------------------------
-# 19. Dual-mode auth middleware
-# ---------------------------------------------------------------------------
-
-class TestDualModeAuth(unittest.TestCase):
-    """Verify BearerAuthMiddleware accepts session tokens and legacy keys."""
+class TestBearerAuthMiddleware(unittest.TestCase):
+    """Verify BearerAuthMiddleware accepts session tokens."""
 
     @patch("token_store.get_token_store")
     @patch("auth.get_http_headers", return_value={"authorization": "Bearer session-token-abc"})
@@ -819,29 +736,10 @@ class TestDualModeAuth(unittest.TestCase):
         call_next.assert_called_once()
         store_instance.has_tokens.assert_called_once_with("session-token-abc")
 
-    @patch("token_store.get_token_store", return_value=None)
-    @patch("auth.get_valid_keys", return_value={"legacy-key-1"})
-    @patch("auth.get_http_headers", return_value={"authorization": "Bearer legacy-key-1"})
-    def test_legacy_key_accepted(self, mock_headers, mock_keys, mock_store):
-        """Legacy API key should be accepted when no token store is available."""
-        import asyncio
-        from auth import BearerAuthMiddleware
-
-        middleware = BearerAuthMiddleware()
-        context = MagicMock()
-        context.method = "tools/call"
-        call_next = AsyncMock(return_value=MagicMock())
-
-        result = asyncio.get_event_loop().run_until_complete(
-            middleware.on_request(context, call_next)
-        )
-        call_next.assert_called_once()
-
     @patch("token_store.get_token_store")
-    @patch("auth.get_valid_keys", return_value=set())
     @patch("auth.get_http_headers", return_value={"authorization": "Bearer invalid-token"})
-    def test_invalid_token_rejected(self, mock_headers, mock_keys, mock_store):
-        """Token not in store and not in legacy keys should be rejected."""
+    def test_invalid_token_rejected(self, mock_headers, mock_store):
+        """Token not in store should be rejected."""
         import asyncio
         from auth import BearerAuthMiddleware
 
@@ -876,43 +774,6 @@ class TestDualModeAuth(unittest.TestCase):
             asyncio.get_event_loop().run_until_complete(
                 middleware.on_request(context, call_next)
             )
-
-
-# ---------------------------------------------------------------------------
-# 20. API key hot-reload (TTL-based refresh)
-# ---------------------------------------------------------------------------
-
-class TestApiKeyHotReload(unittest.TestCase):
-    """Verify get_valid_keys refreshes after TTL expires."""
-
-    def setUp(self):
-        import auth
-        auth._valid_keys = None
-        auth._valid_keys_loaded_at = 0.0
-
-    def test_keys_refresh_after_ttl(self):
-        import auth
-        with patch.dict(os.environ, {"TEAM_API_KEYS": "key-v1"}):
-            keys = auth.get_valid_keys()
-            self.assertIn("key-v1", keys)
-
-        # Simulate TTL expiry
-        auth._valid_keys_loaded_at = time.monotonic() - 301
-
-        with patch.dict(os.environ, {"TEAM_API_KEYS": "key-v2"}):
-            keys = auth.get_valid_keys()
-            self.assertIn("key-v2", keys)
-            self.assertNotIn("key-v1", keys)
-
-    def test_keys_cached_within_ttl(self):
-        import auth
-        with patch.dict(os.environ, {"TEAM_API_KEYS": "key-cached"}):
-            keys1 = auth.get_valid_keys()
-
-        # Within TTL, even if env changes, cache is returned
-        with patch.dict(os.environ, {"TEAM_API_KEYS": "key-new"}):
-            keys2 = auth.get_valid_keys()
-            self.assertIn("key-cached", keys2)
 
 
 # ---------------------------------------------------------------------------

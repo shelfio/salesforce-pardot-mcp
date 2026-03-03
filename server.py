@@ -20,7 +20,6 @@ from starlette.responses import JSONResponse
 
 from auth import BearerAuthMiddleware
 from tools import ALL_TOOLS
-from oauth import oauth_login, oauth_callback, oauth_status, oauth_revoke, pardot_setup
 from mcp_oauth import (
     protected_resource_metadata,
     authorization_server_metadata,
@@ -53,9 +52,7 @@ mcp = FastMCP(
     instructions=(
         "MCP server providing Salesforce CRM and Pardot "
         "(Marketing Cloud Account Engagement) tools.\n\n"
-        "Each user connects their own Salesforce account via OAuth. "
-        "Visit /login in a browser to connect, then use the session "
-        "token in Claude Desktop.\n\n"
+        "Users connect via MCP OAuth 2.1 (Claude Desktop 'Add custom connector').\n\n"
         "Use sf_* tools for Salesforce operations — SOQL queries, "
         "lead/contact CRUD, pipeline reporting, and activity history "
         "(tasks and events).\n\n"
@@ -120,39 +117,9 @@ async def _oauth_register(request: Request):
     return await oauth_register(request)
 
 
-# ---------------------------------------------------------------------------
-# Self-service OAuth endpoints (legacy fallback)
-# ---------------------------------------------------------------------------
-
-
-@mcp.custom_route("/login", methods=["GET"])
-async def _login(request: Request):
-    return await oauth_login(request)
-
-
 @mcp.custom_route("/oauth/callback", methods=["GET"])
 async def _oauth_callback(request: Request):
-    # Try MCP OAuth flow first (returns None if not an MCP flow)
-    mcp_result = await mcp_oauth_callback(request)
-    if mcp_result is not None:
-        return mcp_result
-    # Fall through to legacy callback
-    return await oauth_callback(request)
-
-
-@mcp.custom_route("/oauth/status", methods=["GET"])
-async def _oauth_status(request: Request):
-    return await oauth_status(request)
-
-
-@mcp.custom_route("/oauth/revoke", methods=["POST"])
-async def _oauth_revoke(request: Request):
-    return await oauth_revoke(request)
-
-
-@mcp.custom_route("/pardot/setup", methods=["POST"])
-async def _pardot_setup(request: Request):
-    return await pardot_setup(request)
+    return await mcp_oauth_callback(request)
 
 
 # ---------------------------------------------------------------------------

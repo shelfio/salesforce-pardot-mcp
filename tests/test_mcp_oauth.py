@@ -15,7 +15,6 @@ import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 
 # Set up env vars before importing modules
-os.environ.setdefault("TEAM_API_KEYS", "test-key-1,test-key-2")
 os.environ.setdefault("SF_OAUTH_CLIENT_ID", "test-client-id")
 os.environ.setdefault("SF_OAUTH_CLIENT_SECRET", "test-client-secret")
 os.environ.setdefault("SF_OAUTH_REDIRECT_URI", "http://localhost:8000/oauth/callback")
@@ -490,17 +489,17 @@ class TestDynamicClientRegistration(unittest.TestCase):
 class TestMCPOAuthCallback(unittest.TestCase):
     """Verify MCP-aware /oauth/callback handler."""
 
-    def test_non_mcp_flow_returns_none(self):
+    def test_non_mcp_flow_returns_error(self):
         from mcp_oauth import mcp_oauth_callback
         request = _make_request(query_params={"code": "test", "state": "unknown-state"})
         result = asyncio.get_event_loop().run_until_complete(mcp_oauth_callback(request))
-        self.assertIsNone(result)
+        self.assertEqual(result.status_code, 400)
 
-    def test_missing_params_returns_none(self):
+    def test_missing_params_returns_error(self):
         from mcp_oauth import mcp_oauth_callback
         request = _make_request(query_params={})
         result = asyncio.get_event_loop().run_until_complete(mcp_oauth_callback(request))
-        self.assertIsNone(result)
+        self.assertEqual(result.status_code, 400)
 
     @patch("mcp_oauth.httpx.AsyncClient")
     def test_mcp_callback_redirects_to_claude(self, mock_client_cls):

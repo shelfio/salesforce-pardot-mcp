@@ -88,11 +88,10 @@ def _get_server_url(request: Request) -> str:
     spoofable (Host header poisoning).  The redirect URI is set via env var
     and cannot be influenced by the request.
     """
-    if SF_OAUTH_REDIRECT_URI:
-        parsed = urllib.parse.urlparse(SF_OAUTH_REDIRECT_URI)
-        return f"{parsed.scheme}://{parsed.netloc}"
-    # Fallback for unconfigured dev environments only
-    return f"{request.url.scheme}://{request.url.netloc}"
+    if not SF_OAUTH_REDIRECT_URI:
+        raise ValueError("SF_OAUTH_REDIRECT_URI must be configured")
+    parsed = urllib.parse.urlparse(SF_OAUTH_REDIRECT_URI)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _cleanup_expired_codes() -> None:
@@ -165,8 +164,21 @@ def _sanitize_client_name(name: str) -> str:
     return sanitized[:100] or "unnamed"
 
 
+_dcr_rl_call_count = 0
+
+
 def _check_dcr_rate_limit(client_ip: str) -> bool:
     """Check per-IP rate limit for DCR endpoint. Returns True if allowed."""
+    global _dcr_rl_call_count
+    _dcr_rl_call_count += 1
+
+    # Periodic cleanup of stale entries to prevent memory leak
+    if _dcr_rl_call_count % 100 == 0:
+        now = time.monotonic()
+        stale = [k for k, v in _dcr_request_timestamps.items() if not v or now - v[-1] > 60]
+        for k in stale:
+            del _dcr_request_timestamps[k]
+
     now = time.monotonic()
     window = [t for t in _dcr_request_timestamps[client_ip] if now - t < 60]
     if len(window) >= DCR_MAX_REQUESTS_PER_MINUTE:
@@ -311,20 +323,25 @@ async def oauth_authorize(request: Request) -> RedirectResponse | JSONResponse:
 
 async def mcp_oauth_callback(request: Request):
     """
-    Handle Salesforce OAuth callback. If the state matches an MCP OAuth
-    pending authorization, generate an auth code and redirect to Claude Desktop.
-    Otherwise, fall through to the legacy callback.
+    Handle Salesforce OAuth callback. Matches the state to an MCP OAuth
+    pending authorization, generates an auth code, and redirects to Claude Desktop.
     """
     code = request.query_params.get("code")
     state = request.query_params.get("state")
 
     if not code or not state:
-        return None  # Fall through to legacy handler
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Missing code or state parameter"},
+            status_code=400,
+        )
 
     # Check if this is an MCP OAuth flow
     pending = _auth_codes.get(state)
     if pending is None or pending.get("type") != "pending":
-        return None  # Not an MCP flow — fall through to legacy
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Invalid or expired authorization state"},
+            status_code=400,
+        )
 
     # Remove pending entry
     del _auth_codes[state]
@@ -579,7 +596,7 @@ async def _handle_refresh_token(form) -> JSONResponse:
                 else:
                     logger.warning("MCP OAuth: SF refresh failed (HTTP %d)", resp.status_code)
         except Exception as e:
-            logger.warning("MCP OAuth: SF refresh error: %s", e)
+            logger.warning("MCP OAuth: SF refresh error: %s", type(e).__name__)
 
     # Re-detect Pardot BUID if missing (e.g., session created before auto-detect)
     pardot_buid = old_tokens.get("pardot_business_unit_id")

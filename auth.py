@@ -1,13 +1,9 @@
 """
 Bearer token authentication middleware for the MCP server.
 
-Supports two authentication modes:
-1. Self-service session tokens — generated via /login OAuth flow,
-   validated against the encrypted token store.
-2. Legacy API keys — validated against TEAM_API_KEYS env var
-   (backward compatible, optional).
-
-Includes audit logging (SHA-256 fingerprint) and per-key rate limiting.
+Validates session tokens (from MCP OAuth 2.1 flow) against the encrypted
+token store.  Includes audit logging (SHA-256 fingerprint) and per-key
+rate limiting.
 """
 
 import hashlib
@@ -18,7 +14,6 @@ from collections import defaultdict
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.dependencies import get_http_headers
-from starlette.responses import JSONResponse
 from user_context import current_api_key
 
 logger = logging.getLogger(__name__)
@@ -30,38 +25,11 @@ logger = logging.getLogger(__name__)
 MAX_REQUESTS_PER_MINUTE = 60
 
 # ---------------------------------------------------------------------------
-# Legacy API key loading (optional — only used when TEAM_API_KEYS is set)
-# ---------------------------------------------------------------------------
-
-_valid_keys: set[str] | None = None
-_valid_keys_loaded_at: float = 0.0
-_KEYS_REFRESH_TTL = 300  # Re-read TEAM_API_KEYS every 5 minutes
-
-
-def _load_api_keys() -> set[str]:
-    """Parse TEAM_API_KEYS env var into a set of valid keys."""
-    raw = os.environ.get("TEAM_API_KEYS", "")
-    keys = {k.strip() for k in raw.split(",") if k.strip()}
-    if keys:
-        logger.info("Loaded %d legacy API key(s)", len(keys))
-    return keys
-
-
-def get_valid_keys() -> set[str]:
-    """Load and cache valid API keys with TTL-based refresh (every 5 minutes)."""
-    global _valid_keys, _valid_keys_loaded_at
-    now = time.monotonic()
-    if _valid_keys is None or (now - _valid_keys_loaded_at) >= _KEYS_REFRESH_TTL:
-        _valid_keys = _load_api_keys()
-        _valid_keys_loaded_at = now
-    return _valid_keys
-
-
-# ---------------------------------------------------------------------------
 # Rate limiting (sliding window, per-key)
 # ---------------------------------------------------------------------------
 
 _request_timestamps: dict[str, list[float]] = defaultdict(list)
+_rl_call_count = 0
 
 
 def _check_rate_limit(token: str) -> None:
@@ -69,6 +37,16 @@ def _check_rate_limit(token: str) -> None:
     Enforce a sliding-window rate limit of MAX_REQUESTS_PER_MINUTE per key.
     Raises ValueError if the limit is exceeded.
     """
+    global _rl_call_count
+    _rl_call_count += 1
+
+    # Periodic cleanup of stale entries to prevent memory leak
+    if _rl_call_count % 100 == 0:
+        now = time.monotonic()
+        stale = [k for k, v in _request_timestamps.items() if not v or now - v[-1] > 60]
+        for k in stale:
+            del _request_timestamps[k]
+
     fp = _key_fingerprint(token)
     now = time.monotonic()
     window = [t for t in _request_timestamps[fp] if now - t < 60]
@@ -98,9 +76,8 @@ class BearerAuthMiddleware(Middleware):
     """
     FastMCP middleware that gates every MCP request behind a bearer token.
 
-    Accepts either:
-    - A session token (from /login OAuth flow, stored in TokenStore)
-    - A legacy API key (from TEAM_API_KEYS env var)
+    Validates session tokens from the MCP OAuth 2.1 flow against the
+    encrypted token store.
 
     After successful authentication:
     - Sets current_api_key ContextVar for per-user tool routing
@@ -133,27 +110,22 @@ class BearerAuthMiddleware(Middleware):
 
         token = auth_header.split(" ", 1)[1]
 
-        # --- Try 1: session token (self-service OAuth) ---
+        # --- Validate session token ---
         from token_store import get_token_store
 
         store = get_token_store()
-        is_session_token = store is not None and store.has_tokens(token)
-
-        if not is_session_token:
-            # --- Try 2: legacy API key ---
-            if token not in get_valid_keys():
-                logger.warning("Rejected request — invalid token")
-                raise ValueError("Unauthorized: invalid token")
+        if not store or not store.has_tokens(token):
+            logger.warning("Rejected request — invalid token")
+            raise ValueError("Unauthorized: invalid token")
 
         # --- Rate limiting ---
         _check_rate_limit(token)
 
         # --- Audit log ---
         logger.info(
-            "Authorized — key:%s method:%s mode:%s",
+            "Authorized — key:%s method:%s",
             _key_fingerprint(token),
             context.method,
-            "session" if is_session_token else "legacy",
         )
 
         # --- Set user context for per-user client routing ---
