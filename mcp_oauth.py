@@ -379,6 +379,16 @@ async def mcp_oauth_callback(request: Request):
     Handle Salesforce OAuth callback. Matches the state to an MCP OAuth
     pending authorization, generates an auth code, and redirects to Claude Desktop.
     """
+    # Handle Salesforce-side errors (e.g. OAUTH_APP_BLOCKED, access denied)
+    sf_error = request.query_params.get("error")
+    if sf_error:
+        sf_error_desc = request.query_params.get("error_description", "No description provided")
+        logger.warning("MCP OAuth: Salesforce returned error=%s: %s", sf_error, sf_error_desc)
+        return JSONResponse(
+            {"error": sf_error, "error_description": sf_error_desc},
+            status_code=400,
+        )
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
 
