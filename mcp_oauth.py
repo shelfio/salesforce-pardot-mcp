@@ -159,6 +159,12 @@ def _check_token_rate_limit(key: str) -> bool:
     return True
 
 
+def _pkce_s256_challenge(verifier: str) -> str:
+    """Compute the S256 code_challenge for a given code_verifier (RFC 7636 §4.2)."""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
 def verify_pkce(code_verifier: str, code_challenge: str) -> bool:
     """Verify S256 PKCE challenge (FIX #8: timing-safe comparison)."""
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
@@ -340,6 +346,13 @@ async def oauth_authorize(request: Request) -> RedirectResponse | JSONResponse:
     # the Claude-facing params so we can resume after SF callback.
     internal_state = secrets.token_urlsafe(32)
 
+    # PKCE for upstream Salesforce OAuth (required when the Connected App
+    # has "Require Proof Key for Code Exchange" enabled). The verifier is
+    # generated per-session, kept server-side in the pending entry, and
+    # replayed during the SF token exchange in mcp_oauth_callback.
+    sf_code_verifier = secrets.token_urlsafe(64)
+    sf_code_challenge = _pkce_s256_challenge(sf_code_verifier)
+
     # Store pending authorization
     _auth_codes[internal_state] = {
         "type": "pending",
@@ -348,6 +361,7 @@ async def oauth_authorize(request: Request) -> RedirectResponse | JSONResponse:
         "state": state,
         "code_challenge": code_challenge,
         "scope": scope,
+        "sf_code_verifier": sf_code_verifier,
         "created_at": time.time(),
     }
 
@@ -363,6 +377,8 @@ async def oauth_authorize(request: Request) -> RedirectResponse | JSONResponse:
         "redirect_uri": sf_redirect_uri,
         "state": internal_state,
         "scope": "api refresh_token pardot_api",
+        "code_challenge": sf_code_challenge,
+        "code_challenge_method": "S256",
     }
     authorize_url = f"{SF_OAUTH_LOGIN_URL}/services/oauth2/authorize?{urllib.parse.urlencode(params)}"
 
@@ -419,7 +435,8 @@ async def mcp_oauth_callback(request: Request):
     # FIX #5: Use configured SF_OAUTH_REDIRECT_URI from env
     sf_redirect_uri = SF_OAUTH_REDIRECT_URI
 
-    # Exchange SF authorization code for tokens
+    # Exchange SF authorization code for tokens.
+    # code_verifier is required because we sent code_challenge in /authorize.
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{SF_OAUTH_LOGIN_URL}/services/oauth2/token",
@@ -429,6 +446,7 @@ async def mcp_oauth_callback(request: Request):
                 "client_id": SF_OAUTH_CLIENT_ID,
                 "client_secret": SF_OAUTH_CLIENT_SECRET,
                 "redirect_uri": sf_redirect_uri,
+                "code_verifier": pending["sf_code_verifier"],
             },
         )
         if resp.status_code != 200:

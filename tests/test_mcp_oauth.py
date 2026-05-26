@@ -525,6 +525,7 @@ class TestMCPOAuthCallback(unittest.TestCase):
             "state": "claude-state",
             "code_challenge": "test-challenge",
             "scope": "read",
+            "sf_code_verifier": "test-sf-verifier",
             "created_at": time.time(),
         }
 
