@@ -121,7 +121,9 @@ def _refresh_oauth_token(tokens: dict) -> dict | None:
             import time
             return {
                 "access_token": data["access_token"],
-                "refresh_token": tokens["refresh_token"],  # SF doesn't rotate refresh tokens
+                # SF returns a new refresh token only when Refresh Token
+                # Rotation is enabled on the Connected App; keep ours otherwise
+                "refresh_token": data.get("refresh_token") or tokens["refresh_token"],
                 "instance_url": new_instance_url,
                 "issued_at": time.time(),
                 "pardot_business_unit_id": tokens.get("pardot_business_unit_id"),

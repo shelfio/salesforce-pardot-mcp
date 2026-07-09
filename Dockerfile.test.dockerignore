@@ -1,3 +1,6 @@
+# Ignore rules for the TEST image only (BuildKit picks <Dockerfile>.dockerignore).
+# Same as .dockerignore but keeps tests/ so `docker run sf-pardot-mcp-tests` works.
+
 # Environment and secrets
 .env
 
@@ -38,7 +41,3 @@ CLAUDE.md
 
 # Pytest
 .pytest_cache/
-
-# Test Dockerfile (not needed in production image)
-Dockerfile.test
-tests/

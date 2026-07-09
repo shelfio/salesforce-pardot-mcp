@@ -361,6 +361,92 @@ class TestPardotTokenTTL(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 9b. Pardot 401 recovery (upstream OAuth refresh)
+# ---------------------------------------------------------------------------
+
+class TestPardot401Recovery(unittest.TestCase):
+    """Verify a Pardot 401 triggers a real upstream Salesforce OAuth refresh,
+    not just a re-read of the (possibly expired) stored access token."""
+
+    def setUp(self):
+        import asyncio
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+
+    def tearDown(self):
+        import asyncio
+        self._loop.close()
+        # Leave a usable ambient loop for legacy tests that rely on
+        # asyncio.get_event_loop() (closing without replacing poisons them)
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    def _make_client_with_store(self):
+        import asyncio  # noqa: F401
+        import httpx
+        from tools import pardot
+
+        stale = {
+            "access_token": "stale-token",
+            "refresh_token": "sf-refresh-token",
+            "instance_url": "https://x.my.salesforce.com",
+            "issued_at": time.time(),
+            "pardot_business_unit_id": "0Uv000000000001",
+        }
+        fresh = dict(stale, access_token="fresh-token")
+
+        # Stateful store mock: get() returns whatever was last put()
+        state = {"tokens": stale}
+        mock_store = MagicMock()
+        mock_store.get.side_effect = lambda key: state["tokens"]
+        mock_store.put.side_effect = lambda key, tokens: state.update(tokens=tokens)
+
+        client = pardot.PardotClient("test-key")
+        client._token = "stale-token"
+        client._token_acquired_at = time.monotonic()
+
+        resp_401 = MagicMock(status_code=401)
+        first = MagicMock()
+        first.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "401", request=MagicMock(), response=resp_401
+        )
+        ok = MagicMock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {"values": []}
+
+        mock_http = AsyncMock()
+        mock_http.is_closed = False
+        mock_http.get.side_effect = [first, ok]
+        client._http_client = mock_http
+
+        return pardot, client, mock_store, mock_http, fresh
+
+    def test_401_triggers_upstream_refresh_and_retry(self):
+        pardot, client, mock_store, mock_http, fresh = self._make_client_with_store()
+
+        with patch.object(pardot, "get_token_store", return_value=mock_store), \
+             patch.object(pardot, "_refresh_oauth_token", return_value=fresh) as mock_refresh:
+            result = self._loop.run_until_complete(client.get("prospects"))
+
+        mock_refresh.assert_called_once()
+        mock_store.put.assert_called_once_with("test-key", fresh)
+        self.assertEqual(result, {"values": []})
+        # The retry must carry the refreshed token, not the stale one
+        retry_headers = mock_http.get.call_args_list[1].kwargs["headers"]
+        self.assertEqual(retry_headers["Authorization"], "Bearer fresh-token")
+
+    def test_401_refresh_failure_still_retries_with_stored_token(self):
+        pardot, client, mock_store, mock_http, _ = self._make_client_with_store()
+
+        with patch.object(pardot, "get_token_store", return_value=mock_store), \
+             patch.object(pardot, "_refresh_oauth_token", return_value=None) as mock_refresh:
+            result = self._loop.run_until_complete(client.get("prospects"))
+
+        mock_refresh.assert_called_once()
+        mock_store.put.assert_not_called()
+        self.assertEqual(result, {"values": []})
+
+
+# ---------------------------------------------------------------------------
 # 10. sf_get_tasks
 # ---------------------------------------------------------------------------
 
