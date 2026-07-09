@@ -21,6 +21,7 @@ from fastmcp.exceptions import ToolError
 
 from user_context import get_current_api_key
 from token_store import get_token_store, _hash_key as _cache_key
+from tools.salesforce import _refresh_oauth_token
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,21 @@ class PardotClient:
         """Force token refresh on next request."""
         self._token = None
 
+    async def _force_oauth_refresh(self) -> None:
+        """Refresh the Salesforce access token upstream after a Pardot 401.
+
+        Pardot rejects the token when the underlying SF session expired
+        (org session timeout), so re-reading the stored copy is not enough —
+        the store itself holds the same expired token.
+        """
+        self._invalidate_token()
+        store = get_token_store()
+        tokens = store.get(self._api_key) if store else None
+        if tokens and tokens.get("refresh_token"):
+            new_tokens = await asyncio.to_thread(_refresh_oauth_token, dict(tokens))
+            if new_tokens:
+                store.put(self._api_key, new_tokens)
+
     # -- HTTP helpers -------------------------------------------------------
 
     @staticmethod
@@ -154,7 +170,7 @@ class PardotClient:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 401:
                 logger.warning("Pardot 401 — refreshing token and retrying")
-                self._invalidate_token()
+                await self._force_oauth_refresh()
                 resp = await client.get(url, headers=self._headers(), params=params)
                 resp.raise_for_status()
                 return resp.json()
@@ -175,7 +191,7 @@ class PardotClient:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 401:
                 logger.warning("Pardot 401 — refreshing token and retrying")
-                self._invalidate_token()
+                await self._force_oauth_refresh()
                 resp = await client.post(url, headers=self._headers(), json=json_body)
                 resp.raise_for_status()
                 return resp.json()
@@ -196,7 +212,7 @@ class PardotClient:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 401:
                 logger.warning("Pardot 401 — refreshing token and retrying")
-                self._invalidate_token()
+                await self._force_oauth_refresh()
                 resp = await client.patch(url, headers=self._headers(), json=json_body)
                 resp.raise_for_status()
                 return resp.json()

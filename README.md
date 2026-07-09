@@ -129,7 +129,13 @@ python server.py
 2. Create a new Railway service from the repo
 3. Set environment variables (see table below) as Railway service variables
 4. Set health check path to `/health`
-5. Deploy
+5. **Attach a Railway volume at mount path `/app/data`** — the encrypted token
+   store lives there; without a volume every redeploy wipes all user sessions
+6. Deploy, then fix volume ownership once (Railway mounts volumes root-owned,
+   but the app runs as `appuser`):
+   ```bash
+   railway ssh "chown 100:101 /app/data"
+   ```
 
 The included `railway.toml` and `Dockerfile` handle the rest.
 
