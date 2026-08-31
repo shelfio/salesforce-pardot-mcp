@@ -1,0 +1,18 @@
+[project]
+name = "salesforce-pardot-mcp"
+version = "1.0.0"
+description = "MCP server for Salesforce and Pardot (Account Engagement)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp==3.3.1",
+    "simple-salesforce==1.12.9",
+    "httpx==0.28.1",
+    "python-dotenv==1.2.1",
+    "uvicorn==0.41.0",
+    "cryptography==46.0.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

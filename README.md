@@ -111,9 +111,8 @@ Each returned activity is enriched with `activityLabel` and `category` fields.
 git clone https://github.com/DaniilMai/salesforce-pardot-mcp.git
 cd salesforce-pardot-mcp
 
-python3 -m venv .venv
+uv sync
 source .venv/bin/activate
-pip install -r requirements.txt
 
 cp .env.example .env
 # Edit .env with your Connected App credentials
@@ -210,7 +209,8 @@ tests/
 Dockerfile             # Production container
 Dockerfile.test        # Test runner container
 railway.toml           # Railway deployment config
-requirements.txt       # Python dependencies
+pyproject.toml         # Python dependencies
+uv.lock                # Locked dependency versions
 .env.example           # Environment variable template
 ```
 
