@@ -1,5 +1,7 @@
 # uv settings live in uv.toml, not [tool.uv]: a uv older than 0.9.17 fails to
 # parse the relative exclude-newer value and silently drops the whole [tool.uv]
 # table (required-version included), while an unparseable uv.toml is a hard error.
-required-version = ">=0.11.8"
+required-version = ">=0.13.4"
 exclude-newer = "2 weeks"
+# Security cutoff for GHSA-6q48-6c7w-9gw2; keep the general cooldown.
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }
