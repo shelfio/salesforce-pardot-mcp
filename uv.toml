@@ -4,4 +4,5 @@
 required-version = ">=0.13.4"
 exclude-newer = "2 weeks"
 # Security cutoff for GHSA-6q48-6c7w-9gw2; keep the general cooldown.
+# Temporary security exception: remove certifi's override on 2026-11-04 (INT-1).
 exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }
