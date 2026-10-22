@@ -21,7 +21,7 @@ import threading
 from pathlib import Path
 from typing import TypedDict
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,14 @@ class TokenStore:
             self._cache = {}
             return self._cache
         encrypted = TOKEN_FILE.read_bytes()
-        decrypted = self._fernet.decrypt(encrypted)
+        try:
+            decrypted = self._fernet.decrypt(encrypted)
+        except InvalidToken:
+            # ENCRYPTION_KEY was rotated: old sessions are unreadable, so every
+            # user re-authenticates. The file is overwritten on the next save.
+            logger.warning("Token store undecryptable with current ENCRYPTION_KEY; starting empty")
+            self._cache = {}
+            return self._cache
         self._cache = json.loads(decrypted)
         return self._cache
 
