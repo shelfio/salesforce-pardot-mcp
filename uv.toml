@@ -1,6 +1,8 @@
 # uv settings live in uv.toml, not [tool.uv]: a uv older than 0.9.17 fails to
 # parse the relative exclude-newer value and silently drops the whole [tool.uv]
 # table (required-version included), while an unparseable uv.toml is a hard error.
+# uv 0.13.4 is the first release whose bundled trust store has no compromised
+# emSign root (GHSA-hq85-5cpj-mr62), so it is the floor for every lock and sync.
 required-version = ">=0.13.4"
 exclude-newer = "2 weeks"
 # Security cutoff for GHSA-6q48-6c7w-9gw2; keep the general cooldown.
